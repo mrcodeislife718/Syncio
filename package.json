@@ -1,0 +1,14 @@
+{
+  "name": "syncio-db",
+  "version": "0.1.0",
+  "description": "Syncio embedded realtime database core.",
+  "type": "module",
+  "exports": "./src/index.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
