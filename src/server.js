@@ -2,7 +2,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { ChangeLog, OfflineQueue, createPolicyEngine, createReplicationPacket, verifyReplicationPacket, resolveConflict, queryRecords } from './advanced.js';
 
-export function createSyncioServer({ db, policies = [], authenticate = async () => null, nodeId = crypto.randomUUID() } = {}) {
+export function createSyncioServer({ db, policies = [], authenticate = async () => null, nodeId = crypto.randomUUID(), conflictStrategy = 'last-write-wins' } = {}) {
   if (!db) throw new Error('Syncio server requires a database');
   const policy = createPolicyEngine(policies);
   const changes = new ChangeLog(nodeId);
@@ -22,8 +22,14 @@ export function createSyncioServer({ db, policies = [], authenticate = async () 
       if (req.method === 'POST' && url.pathname === '/replicate/push') {
         if (!authorize(policy, { user, action: 'replicate', collection: '*' }, res)) return;
         if (!verifyReplicationPacket(body)) return json(res, 400, { error: 'invalid_replication_packet' });
-        changes.merge(body.changes ?? []);
-        return json(res, 200, { ok: true, accepted: body.changes?.length ?? 0 });
+        let accepted = 0;
+        for (const change of body.changes ?? []) {
+          await applyReplicatedChange(db, change, { conflictStrategy });
+          changes.merge([change]);
+          publish(subscriptions, change.collection, change);
+          accepted++;
+        }
+        return json(res, 200, { ok: true, accepted });
       }
       if (parts[0] !== 'collections' || !parts[1]) return json(res, 404, { error: 'not_found' });
       const collectionName = decodeURIComponent(parts[1]);
@@ -70,6 +76,7 @@ export function applyReplicatedChange(db, change, { conflictStrategy = 'last-wri
   const collection = db.collection(change.collection);
   if (change.type === 'remove') return collection.remove(change.id);
   const incoming = change.record;
+  if (!incoming?.id) throw new Error('replicated record requires id');
   const current = collection.get(incoming.id);
   const resolved = resolveConflict(current, incoming, conflictStrategy);
   return collection.upsert(resolved);
