@@ -29,7 +29,16 @@ export class SyncioDatabase {
   snapshot() { return structuredClone(this.state); }
   async replaceState(nextState) { this.state = structuredClone(nextState); await this.#persist(); return this.snapshot(); }
   async close() { await this.writeQueue; }
-  async #mutate(collection, mutation, event) { this.writeQueue = this.writeQueue.then(async () => { mutation(); await this.#persist(); const payload = structuredClone({ collection, ...event }); for (const listener of this.listeners.get(collection) ?? []) queueMicrotask(() => listener(payload)); }); return this.writeQueue; }
+  async #mutate(collection, mutation, event) {
+    const operation = this.writeQueue.then(async () => {
+      mutation();
+      await this.#persist();
+      const payload = structuredClone({ collection, ...event });
+      for (const listener of this.listeners.get(collection) ?? []) queueMicrotask(() => listener(payload));
+    });
+    this.writeQueue = operation.catch(() => undefined);
+    return operation;
+  }
   async #persist() { await fs.mkdir(path.dirname(this.file), { recursive: true }); const temp = `${this.file}.${process.pid}.${crypto.randomUUID()}.tmp`; await fs.writeFile(temp, JSON.stringify(this.state, null, 2), 'utf8'); await fs.rename(temp, this.file); }
 }
 
