@@ -1,6 +1,8 @@
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 
+const clone = (value) => structuredClone(value);
+
 export class QueryIndex {
   constructor(field) { this.field = field; this.map = new Map(); }
   rebuild(records) { this.map.clear(); for (const record of records) this.add(record); return this; }
@@ -18,7 +20,7 @@ export function queryRecords(records, spec = {}) {
   }
   if (Number.isInteger(spec.offset) && spec.offset > 0) output = output.slice(spec.offset);
   if (Number.isInteger(spec.limit) && spec.limit >= 0) output = output.slice(0, spec.limit);
-  return output.map(structuredClone);
+  return output.map(clone);
 }
 
 export class TransactionManager {
@@ -39,7 +41,7 @@ export class TransactionManager {
 export class ChangeLog {
   constructor(nodeId = crypto.randomUUID()) { this.nodeId = nodeId; this.clock = 0; this.entries = []; }
   append(change) { const entry = { id: `${this.nodeId}:${++this.clock}`, nodeId: this.nodeId, clock: this.clock, at: new Date().toISOString(), ...structuredClone(change) }; this.entries.push(entry); return structuredClone(entry); }
-  since(cursor = 0) { return this.entries.filter((entry) => entry.clock > cursor).map(structuredClone); }
+  since(cursor = 0) { return this.entries.filter((entry) => entry.clock > cursor).map(clone); }
   merge(entries) { for (const entry of entries) { if (!this.entries.some((item) => item.id === entry.id)) this.entries.push(structuredClone(entry)); } this.entries.sort((a,b) => a.clock-b.clock || a.nodeId.localeCompare(b.nodeId)); return this.entries.length; }
 }
 
@@ -89,7 +91,7 @@ export async function importDatabase(file) { return JSON.parse(await fs.readFile
 
 export function migrate(state, migrations = []) {
   let current = structuredClone(state);
-  for (const migration of migrations.sort((a,b) => a.version-b.version)) {
+  for (const migration of [...migrations].sort((a,b) => a.version-b.version)) {
     if ((current.version ?? 0) >= migration.version) continue;
     current = migration.up(structuredClone(current)); current.version = migration.version;
   }
@@ -97,7 +99,7 @@ export function migrate(state, migrations = []) {
 }
 
 export function createReplicationPacket({ from, cursor = 0, changes = [] }) {
-  return { protocol: 'syncio-replication/1', from, cursor, changes: changes.map(structuredClone), digest: digest({ from, cursor, changes }) };
+  return { protocol: 'syncio-replication/1', from, cursor, changes: changes.map(clone), digest: digest({ from, cursor, changes }) };
 }
 export function verifyReplicationPacket(packet) { return packet?.protocol === 'syncio-replication/1' && packet.digest === digest({ from: packet.from, cursor: packet.cursor, changes: packet.changes }); }
 
@@ -109,7 +111,7 @@ function createDraftApi(draft) {
         get: (id) => structuredClone(draft.collections[name][id] ?? null),
         put: (record) => { if (!record?.id) throw new Error('transaction put requires id'); draft.collections[name][record.id] = structuredClone(record); },
         remove: (id) => delete draft.collections[name][id],
-        all: () => Object.values(draft.collections[name]).map(structuredClone)
+        all: () => Object.values(draft.collections[name]).map(clone)
       };
     }
   };
