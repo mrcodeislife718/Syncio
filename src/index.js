@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+export * from './advanced.js';
 
 export class SyncioDatabase {
   constructor(file, state) {
@@ -38,60 +39,37 @@ export class SyncioDatabase {
         }, { type: 'insert', id, record });
         return structuredClone(record);
       },
-
       async upsert(value) {
         if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('Syncio upsert requires an object');
         if (!value.id) throw new TypeError('Syncio upsert requires value.id');
         const record = structuredClone(value);
-        await db.#mutate(name, () => {
-          db.state.collections[name][record.id] = record;
-        }, { type: 'upsert', id: record.id, record });
+        await db.#mutate(name, () => { db.state.collections[name][record.id] = record; }, { type: 'upsert', id: record.id, record });
         return structuredClone(record);
       },
-
-      get(id) {
-        const value = db.state.collections[name][id];
-        return value ? structuredClone(value) : null;
-      },
-
-      all() {
-        return Object.values(db.state.collections[name]).map((value) => structuredClone(value));
-      },
-
+      get(id) { const value = db.state.collections[name][id]; return value ? structuredClone(value) : null; },
+      all() { return Object.values(db.state.collections[name]).map((value) => structuredClone(value)); },
       async remove(id) {
         let existed = false;
-        await db.#mutate(name, () => {
-          existed = Boolean(db.state.collections[name][id]);
-          delete db.state.collections[name][id];
-        }, { type: 'remove', id });
+        await db.#mutate(name, () => { existed = Boolean(db.state.collections[name][id]); delete db.state.collections[name][id]; }, { type: 'remove', id });
         return existed;
       },
-
       watch(listener) {
         if (typeof listener !== 'function') throw new TypeError('Syncio watch requires a function');
-        const set = db.listeners.get(name) ?? new Set();
-        set.add(listener);
-        db.listeners.set(name, set);
-        return () => {
-          set.delete(listener);
-          if (set.size === 0) db.listeners.delete(name);
-        };
+        const set = db.listeners.get(name) ?? new Set(); set.add(listener); db.listeners.set(name, set);
+        return () => { set.delete(listener); if (set.size === 0) db.listeners.delete(name); };
       },
     });
   }
 
-  async close() {
-    await this.writeQueue;
-  }
+  snapshot() { return structuredClone(this.state); }
+  async replaceState(nextState) { this.state = structuredClone(nextState); await this.#persist(); return this.snapshot(); }
+  async close() { await this.writeQueue; }
 
   async #mutate(collection, mutation, event) {
     this.writeQueue = this.writeQueue.then(async () => {
-      mutation();
-      await this.#persist();
+      mutation(); await this.#persist();
       const payload = structuredClone({ collection, ...event });
-      for (const listener of this.listeners.get(collection) ?? []) {
-        queueMicrotask(() => listener(payload));
-      }
+      for (const listener of this.listeners.get(collection) ?? []) queueMicrotask(() => listener(payload));
     });
     return this.writeQueue;
   }
@@ -104,6 +82,4 @@ export class SyncioDatabase {
   }
 }
 
-export async function open(file) {
-  return SyncioDatabase.open(file);
-}
+export async function open(file) { return SyncioDatabase.open(file); }
