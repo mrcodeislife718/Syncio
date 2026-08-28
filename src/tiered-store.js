@@ -1,3 +1,4 @@
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -36,54 +37,70 @@ export class SegmentedDocumentStore {
   get size(){return this.state.recordCount;}
   stats(){return Object.freeze({records:this.state.recordCount,tombstones:this.state.tombstones,segments:this.state.activeSegment,activeSegmentBytes:this.state.activeBytes,indexEntries:this.index.size,cache:this.cache.stats()});}
   has(id){validateId(id);const entry=this.index.get(id);return Boolean(entry&&!entry.deleted);}
+  ids(){return [...this.index.entries()].filter(([,entry])=>!entry.deleted).map(([id])=>id).sort();}
 
-  async get(id){
+  getSync(id){
     validateId(id);
     const cached=this.cache.get(id); if(cached!==undefined)return clone(cached);
     const entry=this.index.get(id); if(!entry||entry.deleted)return null;
-    const envelope=await this.#readEntry(entry);
+    const envelope=this.#readEntrySync(entry);
     if(envelope.id!==id||envelope.deleted)throw corruption('segment/index identity mismatch');
     this.cache.set(id,envelope.record);
     return clone(envelope.record);
   }
 
+  async get(id){return this.getSync(id);}
+
+  allSync(){const records=[];for(const id of this.ids()){const record=this.getSync(id);if(record)records.push(record);}return records;}
+
+  *scanSync(){for(const id of this.ids()){const record=this.getSync(id);if(record)yield record;}}
+
   async put(record){
     validateRecord(record);
-    const value=clone(record);
-    return this.#enqueue(async()=>{
-      const previous=this.index.get(value.id);
-      const envelope={version:1,sequence:++this.state.sequence,id:value.id,deleted:false,record:value,at:new Date().toISOString()};
-      const entry=await this.#appendEnvelope(envelope);
-      this.index.set(value.id,entry);
-      if(!previous||previous.deleted)this.state.recordCount+=1;
-      this.cache.set(value.id,value);
-      await this.#persistMetadata();
-      return clone(value);
-    });
+    const [result]=await this.applyBatch([{type:'put',record}]);
+    return result;
   }
 
   async remove(id){
     validateId(id);
+    const [result]=await this.applyBatch([{type:'remove',id}]);
+    return result;
+  }
+
+  async applyBatch(operations=[]){
+    if(!Array.isArray(operations))throw new TypeError('segment batch must be an array');
+    for(const op of operations){if(!op||typeof op!=='object')throw new TypeError('invalid segment operation');if(op.type==='put')validateRecord(op.record);else if(op.type==='remove')validateId(op.id);else throw new TypeError('invalid segment operation type');}
     return this.#enqueue(async()=>{
-      const previous=this.index.get(id); if(!previous||previous.deleted)return false;
-      const envelope={version:1,sequence:++this.state.sequence,id,deleted:true,at:new Date().toISOString()};
-      const entry=await this.#appendEnvelope(envelope);
-      this.index.set(id,entry);this.state.recordCount-=1;this.state.tombstones+=1;this.cache.delete(id);
-      await this.#persistMetadata();return true;
+      const results=[];
+      for(const operation of operations){
+        if(operation.type==='put'){
+          const value=clone(operation.record);const previous=this.index.get(value.id);
+          const envelope={version:1,sequence:++this.state.sequence,id:value.id,deleted:false,record:value,at:new Date().toISOString()};
+          const entry=await this.#appendEnvelope(envelope);this.index.set(value.id,entry);
+          if(!previous||previous.deleted)this.state.recordCount+=1;this.cache.set(value.id,value);results.push(clone(value));
+        }else{
+          const id=operation.id;const previous=this.index.get(id);
+          if(!previous||previous.deleted){results.push(false);continue;}
+          const envelope={version:1,sequence:++this.state.sequence,id,deleted:true,at:new Date().toISOString()};
+          const entry=await this.#appendEnvelope(envelope);this.index.set(id,entry);this.state.recordCount-=1;this.state.tombstones+=1;this.cache.delete(id);results.push(true);
+        }
+      }
+      if(operations.length)await this.#persistMetadata();
+      return results;
     });
   }
 
   async *scan({ batchSize = 256 } = {}){
     if(!Number.isSafeInteger(batchSize)||batchSize<1)throw new TypeError('batchSize must be positive');
-    const ids=[...this.index.entries()].filter(([,entry])=>!entry.deleted).map(([id])=>id).sort();
-    for(let i=0;i<ids.length;i+=batchSize){const batch=ids.slice(i,i+batchSize);for(const id of batch){const record=await this.get(id);if(record)yield record;}}
+    const ids=this.ids();
+    for(let i=0;i<ids.length;i+=batchSize){const batch=ids.slice(i,i+batchSize);for(const id of batch){const record=this.getSync(id);if(record)yield record;}}
   }
 
   async compact(){
     return this.#enqueue(async()=>{
       const tempDir=path.join(this.directory,`.compact-${crypto.randomUUID()}`);
       const replacement=await SegmentedDocumentStore.open(tempDir,{segmentBytes:this.segmentBytes,cacheBytes:0,fsync:this.fsync});
-      for await(const record of this.scan())await replacement.put(record);
+      for(const record of this.scanSync())await replacement.put(record);
       await replacement.close();
       const oldDir=path.join(this.directory,`.old-${crypto.randomUUID()}`);
       const entries=await fs.readdir(this.directory);
@@ -110,10 +127,11 @@ export class SegmentedDocumentStore {
     return {segment:this.state.activeSegment,offset,length:payload.length,sequence:envelope.sequence,deleted:Boolean(envelope.deleted)};
   }
 
-  async #readEntry(entry){
-    const handle=await fs.open(this.#segmentFile(entry.segment),'r');
-    try{const buffer=Buffer.alloc(entry.length);const {bytesRead}=await handle.read(buffer,0,entry.length,entry.offset);if(bytesRead!==entry.length)throw corruption('short segment read');const text=buffer.toString('utf8');if(!text.endsWith('\n'))throw corruption('incomplete segment entry');return JSON.parse(text);}
-    finally{await handle.close();}
+  #readEntrySync(entry){
+    const fd=fsSync.openSync(this.#segmentFile(entry.segment),'r');
+    try{const buffer=Buffer.allocUnsafe(entry.length);const bytesRead=fsSync.readSync(fd,buffer,0,entry.length,entry.offset);if(bytesRead!==entry.length)throw corruption('short segment read');const text=buffer.toString('utf8');if(!text.endsWith('\n'))throw corruption('incomplete segment entry');return JSON.parse(text);}
+    catch(error){if(error?.code==='SYNCIO_SEGMENT_CORRUPT')throw error;throw corruption(`segment read failed: ${error.message}`);}
+    finally{fsSync.closeSync(fd);}
   }
 
   #segmentFile(number){return path.join(this.directory,`segment-${String(number).padStart(8,'0')}.ndjson`);}
@@ -137,7 +155,9 @@ export class TieredStatePlane {
   constructor(root,options){this.root=path.resolve(root);this.options=options;this.collections=new Map();}
   static async open(root,options={}){await fs.mkdir(path.resolve(root),{recursive:true});return new TieredStatePlane(root,options);}
   async collection(name){validateCollection(name);if(!this.collections.has(name))this.collections.set(name,await SegmentedDocumentStore.open(path.join(this.root,encodeURIComponent(name)),this.options));return this.collections.get(name);}
-  async stats(){const result={};for(const [name,store] of this.collections)result[name]=store.stats();return result;}
+  getOpened(name){validateCollection(name);return this.collections.get(name)??null;}
+  async stats(){const result={};for(const [name,store]of this.collections)result[name]=store.stats();return result;}
+  async compact(){const result={};for(const [name,store]of this.collections)result[name]=await store.compact();return result;}
   async close(){await Promise.all([...this.collections.values()].map((store)=>store.close()));this.collections.clear();}
 }
 
@@ -152,8 +172,8 @@ class LruByteCache{
 function validateManifest(value){if(!value||value.version!==1||!Number.isSafeInteger(value.activeSegment)||value.activeSegment<1||!Number.isSafeInteger(value.activeBytes)||value.activeBytes<0||!Number.isSafeInteger(value.sequence)||value.sequence<0||!Number.isSafeInteger(value.recordCount)||value.recordCount<0||!Number.isSafeInteger(value.tombstones)||value.tombstones<0)throw corruption('invalid segmented-store manifest');}
 function validateEntry(entry){if(!entry||!Number.isSafeInteger(entry.segment)||entry.segment<1||!Number.isSafeInteger(entry.offset)||entry.offset<0||!Number.isSafeInteger(entry.length)||entry.length<2||!Number.isSafeInteger(entry.sequence)||entry.sequence<1)throw corruption('invalid offset-index entry');}
 function validateId(id){if(typeof id!=='string'||!id||id.length>512)throw new TypeError('record id must be non-empty string up to 512 chars');}
-function validateRecord(record){if(!record||typeof record!=='object'||Array.isArray(record))throw new TypeError('record must be object');validateId(record.id);JSON.stringify(record);}
+function validateRecord(record){if(!record||typeof record!=='object'||Array.isArray(record))throw new TypeError('record must be object');validateId(record.id);const serialized=JSON.stringify(record);if(serialized===undefined)throw new TypeError('record must be JSON serializable');}
 function validateCollection(name){if(typeof name!=='string'||!/^[A-Za-z0-9_-]+$/.test(name)||name.length>128)throw new TypeError('invalid collection name');}
 function corruption(message){const error=new Error(message);error.code='SYNCIO_SEGMENT_CORRUPT';return error;}
 async function exists(file){try{await fs.access(file);return true;}catch{return false;}}
-async function atomicWriteJson(target,value){const temp=`${target}.${process.pid}.${crypto.randomUUID()}.tmp`;try{await fs.writeFile(temp,`${JSON.stringify(value)}\n`,{encoding:'utf8',mode:0o600});const handle=await fs.open(temp,'r');try{await handle.sync();}finally{await handle.close();}await fs.rename(temp,target);const dir=await fs.open(path.dirname(target),'r');try{await dir.sync();}finally{await dir.close();}}finally{await fs.rm(temp,{force:true}).catch(()=>undefined);}}
+async function atomicWriteJson(target,value){const temp=`${target}.${process.pid}.${crypto.randomUUID()}.tmp`;try{await fs.mkdir(path.dirname(target),{recursive:true});await fs.writeFile(temp,`${JSON.stringify(value)}\n`,{encoding:'utf8',mode:0o600});const handle=await fs.open(temp,'r');try{await handle.sync();}finally{await handle.close();}await fs.rename(temp,target);const dir=await fs.open(path.dirname(target),'r');try{await dir.sync();}finally{await dir.close();}}finally{await fs.rm(temp,{force:true}).catch(()=>undefined);}}
