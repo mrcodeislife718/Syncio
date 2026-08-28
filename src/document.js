@@ -236,11 +236,16 @@ function pullUpdate(document, field, condition) {
   const current = readDirectPath(document, field);
   if (!current.exists) return;
   if (!Array.isArray(current.value)) throw new TypeError('$pull target must be an array');
-  const retained = current.value.filter((item) => {
-    if (condition && typeof condition === 'object' && !Array.isArray(condition) && Object.keys(condition).some((key) => key.startsWith('$'))) return !matchesCondition([item], condition);
-    return !equalMongoLike(item, condition);
-  });
+  const retained = current.value.filter((item) => !pullMatches(item, condition));
   setMutable(document, field, retained);
+}
+
+function pullMatches(item, condition) {
+  if (!condition || typeof condition !== 'object' || Array.isArray(condition)) return equalMongoLike(item, condition);
+  const keys = Object.keys(condition);
+  if (keys.some((key) => key.startsWith('$'))) return matchesCondition([item], condition);
+  if (item && typeof item === 'object' && !Array.isArray(item)) return matchesDocument(item, condition);
+  return equalMongoLike(item, condition);
 }
 
 function renamePath(document, from, to) {
