@@ -38,5 +38,6 @@ test('billing webhook rejects tampering stale timestamps and malformed signature
   await assert.rejects(webhook.process({rawBody:`${raw} `,signature}),/billing_webhook_invalid_signature/);
   now+=61_000;
   await assert.rejects(webhook.process({rawBody:raw,signature}),/billing_webhook_expired/);
+  now=1_800_000_000_000;
   await assert.rejects(webhook.process({rawBody:raw,signature:'t=1800000000,v1=zz'}),/billing_webhook_invalid_signature/);
 });
