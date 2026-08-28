@@ -4,6 +4,7 @@ import { OfflineQueue, createPolicyEngine, createReplicationPacket, verifyReplic
 
 const DEFAULT_MAX_BODY_BYTES = 1_048_576;
 const DEFAULT_REPLICATION_LIMIT = 1_000;
+const DEFAULT_MAX_SUBSCRIPTIONS = 1_000;
 
 export function createSyncioServer({
   db,
@@ -13,14 +14,17 @@ export function createSyncioServer({
   conflictStrategy = 'last-write-wins',
   maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
   replicationLimit = DEFAULT_REPLICATION_LIMIT,
+  maxSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS,
   observe = () => undefined
 } = {}) {
   if (!db) throw new Error('Syncio server requires a database');
   if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes < 1) throw new TypeError('maxBodyBytes must be a positive safe integer');
   if (!Number.isSafeInteger(replicationLimit) || replicationLimit < 1 || replicationLimit > 10_000) throw new TypeError('replicationLimit must be between 1 and 10000');
+  if (!Number.isSafeInteger(maxSubscriptions) || maxSubscriptions < 1) throw new TypeError('maxSubscriptions must be a positive safe integer');
 
   const policy = createPolicyEngine(policies);
   const subscriptions = new Map();
+  const networkStreams = new Set();
 
   const server = http.createServer(async (req, res) => {
     const requestId = requestIdFor(req);
@@ -30,7 +34,7 @@ export function createSyncioServer({
     try {
       const url = new URL(req.url, 'http://syncio.local');
       if (req.method === 'GET' && url.pathname === '/health') {
-        return respond(res, 200, { ok: true, nodeId, sequence: db.sequence }, { observe, requestId, req, startedAt });
+        return respond(res, 200, { ok: true, nodeId, sequence: db.sequence, subscriptions: networkStreams.size }, { observe, requestId, req, startedAt });
       }
 
       const user = await authenticate(req);
@@ -71,6 +75,13 @@ export function createSyncioServer({
           }
         }
         return respond(res, 200, { ok: true, accepted, duplicates, sequence: db.sequence }, { observe, requestId, req, startedAt });
+      }
+
+      if (req.method === 'GET' && parts[0] === 'subscribe' && parts[1] && !parts[2]) {
+        const collectionName = decodeURIComponent(parts[1]);
+        if (!authorize(policy, { user, action: 'read', collection: collectionName }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
+        if (networkStreams.size >= maxSubscriptions) return respond(res, 429, { error:'subscription_capacity_exceeded', requestId }, { observe, requestId, req, startedAt });
+        return openEventStream({ req, res, collectionName, requestId, startedAt, subscriptions, networkStreams, observe, sequence:()=>db.sequence });
       }
 
       if (parts[0] !== 'collections' || !parts[1]) {
@@ -138,26 +149,26 @@ export function createSyncioServer({
       return { host, port: address.port, url: `http://${host}:${address.port}` };
     },
     async close() {
+      for (const stream of [...networkStreams]) stream.end();
+      networkStreams.clear();
       if (server.listening) await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     },
     subscribe(collection, listener) {
       if (typeof listener !== 'function') throw new TypeError('Syncio subscribe requires a function');
-      const set = subscriptions.get(collection) ?? new Set();
-      set.add(listener);
-      subscriptions.set(collection, set);
-      return () => { set.delete(listener); if (!set.size) subscriptions.delete(collection); };
+      return addSubscription(subscriptions, collection, listener);
     }
   };
 }
 
 export class ReplicationClient {
-  constructor({ baseUrl, nodeId = crypto.randomUUID(), fetchImpl = globalThis.fetch, cursor = 0 } = {}) {
+  constructor({ baseUrl, nodeId = crypto.randomUUID(), fetchImpl = globalThis.fetch, cursor = 0, offlineQueue = new OfflineQueue() } = {}) {
     if (!baseUrl) throw new TypeError('ReplicationClient requires baseUrl');
     if (typeof fetchImpl !== 'function') throw new TypeError('ReplicationClient requires fetch');
+    if (!offlineQueue || typeof offlineQueue.enqueue !== 'function' || typeof offlineQueue.flush !== 'function') throw new TypeError('ReplicationClient offlineQueue must implement enqueue and flush');
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.nodeId = nodeId;
     this.fetch = fetchImpl;
-    this.offline = new OfflineQueue();
+    this.offline = offlineQueue;
     this.cursor = normalizeCursor(cursor);
   }
 
@@ -204,9 +215,12 @@ export class ReplicationClient {
 
   async flush() {
     return this.offline.flush(async (item) => {
-      const change = { ...item };
+      const change = item.change ? { ...item.change, changeId:item.change.changeId ?? item.idempotencyKey } : { ...item };
       delete change.queueId;
       delete change.attempts;
+      delete change.idempotencyKey;
+      delete change.enqueuedAt;
+      delete change.lastAttemptAt;
       change.changeId ??= crypto.randomUUID();
       const packet = createReplicationPacket({ from: this.nodeId, cursor: this.cursor, changes: [change] });
       const response = await this.fetch(`${this.baseUrl}/replicate/push`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(packet) });
@@ -228,6 +242,50 @@ export async function applyReplicatedChange(db, change, { conflictStrategy = 'la
   const resolved = resolveConflict(current, incoming, conflictStrategy);
   await collection.upsert(resolved);
   return { applied: true, duplicate: false };
+}
+
+function openEventStream({ req, res, collectionName, requestId, startedAt, subscriptions, networkStreams, observe, sequence }) {
+  res.statusCode=200;
+  res.setHeader('content-type','text/event-stream; charset=utf-8');
+  res.setHeader('cache-control','no-cache, no-transform');
+  res.setHeader('connection','keep-alive');
+  res.flushHeaders?.();
+  networkStreams.add(res);
+  let closed=false;
+  let stop;
+  const cleanup=(reason='closed')=>{
+    if (closed) return;
+    closed=true;
+    clearInterval(heartbeat);
+    stop?.();
+    networkStreams.delete(res);
+    safeObserve(observe,{type:'subscription_closed',requestId,collection:collectionName,reason,durationMs:Number(process.hrtime.bigint()-startedAt)/1_000_000});
+  };
+  const send=(eventName,data)=>{
+    if (closed || res.writableEnded) return false;
+    const ok=res.write(`event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`);
+    if (!ok) {
+      safeObserve(observe,{type:'subscription_backpressure',requestId,collection:collectionName});
+      cleanup('backpressure');
+      res.end();
+      return false;
+    }
+    return true;
+  };
+  stop=addSubscription(subscriptions,collectionName,(change)=>send('change',change));
+  const heartbeat=setInterval(()=>send('heartbeat',{sequence:sequence()}),15_000);
+  heartbeat.unref?.();
+  req.once('close',()=>cleanup('client_closed'));
+  res.once('close',()=>cleanup('response_closed'));
+  send('ready',{collection:collectionName,sequence:sequence(),requestId});
+  safeObserve(observe,{type:'subscription_opened',requestId,collection:collectionName});
+}
+
+function addSubscription(subscriptions, collection, listener) {
+  const set=subscriptions.get(collection)??new Set();
+  set.add(listener);
+  subscriptions.set(collection,set);
+  return ()=>{set.delete(listener);if(!set.size)subscriptions.delete(collection);};
 }
 
 function cloneSnapshotState(state) {
