@@ -53,7 +53,7 @@ test('persistent text index returns ranked documents and updates after mutation'
   await state.db.collection('docs').upsert({id:'a',title:'Realtime database',body:'durable realtime sync realtime'});
   await state.db.collection('docs').upsert({id:'b',title:'Database notes',body:'storage engine'});
   assert.deepEqual(state.db.search('docs','realtime database',{index:'docs_text'}).map((row)=>row.record.id),['a','b']);
-  await state.db.collection('docs').update('b',{$set:{body:'realtime realtime realtime'}});
+  await state.db.collection('docs').update('b',{$set:{body:'realtime realtime realtime realtime'}});
   assert.equal(state.db.search('docs','realtime',{index:'docs_text'})[0].record.id,'b');
   await state.db.close();
   state.db=await ProductionSyncioDatabase.open(state.file);
