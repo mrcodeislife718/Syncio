@@ -12,7 +12,8 @@ try {
     port: config.port ?? 0,
     ttlSweepIntervalMs: config.ttlSweepIntervalMs ?? 60_000,
     pitrSnapshotIntervalMs: config.pitrSnapshotIntervalMs ?? 3_600_000,
-    databaseOptions: config.databaseOptions ?? {}
+    databaseOptions: config.databaseOptions ?? {},
+    usageObserver: (event) => process.send?.({ type:'usage', projectId:config.projectId, event })
   });
   process.send?.({ type:'ready', projectId:config.projectId, region:config.region, address:runtime.address, pid:process.pid });
 } catch (error) {
