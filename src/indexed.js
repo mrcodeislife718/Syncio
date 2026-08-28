@@ -56,7 +56,11 @@ export class IndexedSyncioDatabase {
       async insert(value){const result=await baseCollection.insert(value);db.#updateIndexes(name,null,result);return result;},
       async upsert(value){const before=value?.id?baseCollection.get(value.id):null;const result=await baseCollection.upsert(value);db.#updateIndexes(name,before,result);return result;},
       get:(id)=>baseCollection.get(id),
-      all:()=>baseCollection.all(),
+      all(){
+        const records=baseCollection.all();
+        Object.defineProperty(records,'__syncioQuery',{value:(spec)=>db.query(name,spec),enumerable:false,configurable:false,writable:false});
+        return records;
+      },
       async remove(id){const before=baseCollection.get(id);const result=await baseCollection.remove(id);if(result)db.#updateIndexes(name,before,null);return result;},
       watch:(listener)=>baseCollection.watch(listener),
       query(spec={}){return db.query(name,spec);},
