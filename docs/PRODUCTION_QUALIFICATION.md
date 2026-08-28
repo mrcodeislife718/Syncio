@@ -6,48 +6,47 @@ Qualification posture: attempt to prove the product is **not** ready. Untested c
 
 **NOT READY for public managed-cloud production.**
 
-**Self-host core qualification: CONDITIONALLY READY for controlled technical use**, subject to operator-provided TLS termination, secret management, backups and operational monitoring.
+**Self-host core qualification: CONDITIONALLY READY for controlled technical use**, subject to operator-provided TLS termination, secret management, remote monitoring and backup operations.
 
 ## Verification matrix
 
 | Requirement | Result | Evidence |
 | --- | --- | --- |
-| Installation / dependency integrity | PASS | Dependency-free runtime; `npm install --ignore-scripts --no-package-lock` reports zero package vulnerabilities in CI. |
+| Installation / dependency integrity | PASS | Dependency-free runtime; CI installation reports zero package vulnerabilities. |
 | Syntax / static parse checks | PASS | `npm run check` checks every production entrypoint and qualification script. |
 | Formatting | UNVERIFIED | No formatter gate is defined. |
-| Type checking | UNVERIFIED | JavaScript runtime validation is extensive; no static type system is configured. |
-| Unit tests | PASS | Node test runner covers core utilities and policies. |
-| Integration tests | PASS | Real filesystem and HTTP tests cover persistence, replication, auth, hosted control, indexed HTTP queries and self-host operation. |
-| Contract tests | PASS | Replication/snapshot digests, billing webhook signatures, token canonicalization and policy contracts are tested. |
-| Database tests | PASS | Restart durability, transaction rollback, contention, indexes and corruption recovery. |
+| Type checking | UNVERIFIED | Runtime validation is extensive; no static type system is configured. |
+| Unit tests | PASS | Node test runner covers core utilities, storage, policy and resource-control behavior. |
+| Integration tests | PASS | Real filesystem and HTTP tests cover WAL persistence, realtime, replication, auth, control plane, indexed queries and self-host operation. |
+| Contract tests | PASS | WAL digests, replication/snapshot digests, billing signatures, token canonicalization, SSE resume IDs and policy contracts are tested. |
+| Database tests | PASS | Restart durability, WAL replay, checkpoint compaction, latest-checkpoint backup recovery, transaction rollback, contention and indexes. |
 | Migration tests | PASS | Backup-gated migration, failed migration and rollback. |
 | End-to-end self-host | PASS | Container build/start/health/anonymous deny/token/authenticated write/clean stop. |
+| Realtime change streams | PASS | Live delivery, durable sequence event IDs, missed-change replay, `Last-Event-ID`, transaction event ordering, expired-cursor rejection and connection capacity are tested. |
 | Authentication | PASS | First-party signed tokens, expiry, tamper/canonical encoding and tenant scope. |
 | Authorization | PARTIAL | Default deny, deny override, body policies, entitlements and tenant ownership pass. Per-record read/field authorization remains. |
-| Billing | PARTIAL | Atomic billing-state processor and verified signed webhook pass. Live payment provider/checkout is UNVERIFIED. |
-| Entitlements | PASS | Durable plan grants, downgrade freshness and token authorization boundaries. |
-| External integrations | UNVERIFIED | No live payment provider, KMS, remote metrics or managed storage integration is exercised. |
-| Security tests | PASS/PARTIAL | Input limits, error redaction, deny-by-default, signature tamper rejection, rate limits pass; TLS/KMS/secret rotation remain UNVERIFIED. |
-| Performance tests | PARTIAL | Reproducible benchmark harness and contention tests exist; accepted comparative thresholds do not. |
-| Load tests | PARTIAL | Concurrent writers/transactions and bounded SSE connections are tested; sustained 1x/10x/100x load is UNVERIFIED. |
+| Billing | PARTIAL | Atomic billing-state processor and verified signed webhook pass. Live provider/checkout is UNVERIFIED. |
+| Entitlements | PASS | Durable plan grants, downgrade freshness and token boundaries. |
+| External integrations | UNVERIFIED | No live payment provider, KMS, remote telemetry backend or managed object storage is exercised. |
+| Security tests | PASS/PARTIAL | Input limits, error redaction, deny-by-default, signature tamper rejection, WAL corruption detection and rate limits pass; TLS/KMS/rotation remain UNVERIFIED. |
+| Performance tests | PARTIAL | Benchmark harness and contention tests exist; accepted comparative competitor thresholds do not. |
+| Load tests | PARTIAL | Concurrent writers/transactions and bounded SSE connections are tested; sustained 1x/10x/100x workloads remain UNVERIFIED. |
 | Concurrency tests | PASS | Concurrent writer preservation, 100 contended transactions and failure recovery. |
-| Failure injection | PARTIAL | Corrupt file, failed write/transaction, offline replication, malformed data, expired cursor and tampered snapshots/backups are tested. Power-loss-at-every-write-boundary is UNVERIFIED. |
-| Recovery tests | PASS/PARTIAL | Backup recovery, replication snapshot reseed and migration rollback pass; regional/cluster recovery is UNVERIFIED. |
-| Backup tests | PASS | Encrypted backup roundtrip, tamper rejection and database identity verification. |
-| Restore tests | PASS | Restore and migration rollback execute against real persisted state. |
-| Deployment tests | PASS for self-host | Non-root image is built and exercised in CI. Managed-cloud deploy is UNVERIFIED. |
+| Failure injection | PARTIAL | Corrupt checkpoint, corrupt/truncated WAL, failed transaction, offline replication, malformed input, expired cursor and tampered snapshots/backups are tested. Disk-full and kill-at-every-write-boundary remain UNVERIFIED. |
+| Recovery tests | PASS/PARTIAL | WAL replay, latest-checkpoint backup, replication reseed and migration rollback pass; cluster/region recovery is UNVERIFIED. |
+| Backup tests | PASS | Encrypted backup and latest local checkpoint backup integrity/recovery paths are exercised. |
+| Restore tests | PASS | Restore and migration rollback execute against persisted state. |
+| Deployment tests | PASS for self-host | Non-root image is built and exercised in CI. Managed-cloud deployment is UNVERIFIED. |
 | Rollback tests | PARTIAL | Database migration rollback passes; application/image rollback is UNVERIFIED. |
-| Observability | PARTIAL | Request metrics and durable audit events exist; remote metrics/tracing/alerting/SLOs remain UNVERIFIED. |
-| Privacy export/deletion | PASS at technical layer | Account export, redaction, project disablement and token invalidation are tested. Legal/compliance retention policy is external. |
-| AI/agent evaluations | N/A | Syncio currently has no AI/agent execution path. |
+| Observability | PARTIAL | Request metrics, storage health and durable audit events exist; remote metrics/tracing/alerting/SLOs remain UNVERIFIED. |
+| Privacy export/deletion | PASS at technical layer | Account export, redaction, project disablement and token invalidation are tested. Legal retention policy is external. |
+| AI/agent evaluations | N/A | Syncio has no model/agent execution path. |
 
 ## Realistic failure coverage
 
-PASS: process/database reopen, corrupt primary snapshot with valid backup, duplicate mutation, duplicate replication change, network/offline send failure, replication history expiry, tampered replication snapshot, failed transaction, failed migration, malformed JSON, oversized request body, unauthorized request, stale entitlement after downgrade, duplicate billing event, tampered/expired billing webhook, SSE capacity exhaustion, token signature encoding ambiguity, HTTP indexed-query planner integration.
+PASS: process/database reopen, WAL replay, interrupted final WAL append, completed WAL corruption, stale WAL after durable checkpoint, corrupt primary checkpoint with latest backup, duplicate replication, network/offline send failure, replication/realtime history expiry, tampered snapshot, failed transaction/migration, malformed/oversized input, unauthorized request, stale entitlement after downgrade, duplicate/tampered/expired billing event, SSE capacity exhaustion, token encoding ambiguity, HTTP index-planner integration.
 
-UNVERIFIED: host disk full, filesystem read-only transition, OS kill at every fsync/rename boundary, multi-machine partition with simultaneous conflicting writes beyond current LWW tests, remote object-store outage, managed queue outage, KMS outage/rotation, TLS certificate failure, production payment provider outage, distributed rate-limit state loss, multi-region failover.
-
-N/A: model timeout, malformed model response, prompt injection, indirect prompt injection, tool-loop behavior and model disagreement because no model/agent path is present.
+UNVERIFIED: host disk full, filesystem switching read-only, OS kill at every individual persistence boundary, remote object-store outage, KMS outage/rotation, TLS certificate failure, production payment-provider outage, distributed rate-limit state loss, multi-region partition/failover and large sharded workloads.
 
 ## Exact qualification commands
 
@@ -67,34 +66,33 @@ docker run -d --name syncio-qualification \
 curl --fail http://127.0.0.1:18787/health
 ```
 
-CI additionally issues a token from the built image, proves an anonymous data request returns 403, performs an authenticated write returning 200, and stops the container cleanly.
+CI additionally issues a real Syncio token from the built image, proves anonymous data access is denied, performs an authenticated write, and stops the process cleanly.
 
 ## Blocking failures
 
-1. Managed hosted data plane and tenant scheduling/isolation are absent.
+1. Managed hosted data-plane tenant scheduling/routing/isolation is absent.
 2. Live checkout/payment-provider end-to-end flow is absent.
-3. Current snapshot engine rewrites/clones full logical state per commit and lacks WAL/segment/compaction scale evidence.
+3. Normal disk commits are now WAL-first, but large transactions/mutations still clone substantial logical state in memory; the 10x/100x architecture needs paged/segmented state and incremental write sets.
 4. GitHub `main` branch protection is disabled.
 
-## Nonblocking defects / limitations
+## Nonblocking limitations
 
-- HTTP equality queries now prove use of the persistent query planner/index path when eligible; broader compound/range planner optimization remains a performance opportunity, not a correctness gap.
-- SSE provides live changes but no reconnect cursor/replay contract.
-- LWW conflict resolution is deterministic but limited.
-- In-memory metrics are not a production telemetry backend.
+- Query capability is not yet MongoDB-class: nested operator semantics, projections, compound/unique indexes, aggregation, atomic update operators, schemas, TTL, geo and text search remain.
+- LWW conflict resolution is deterministic but intentionally limited.
+- Metrics are not yet exported to a production telemetry backend.
 - Audit files are durable but not independently immutable or remotely anchored.
 - Static typing/formatting gates are not configured.
 
 ## Required repairs before managed launch
 
-1. Implement hosted data-plane project routing, isolated resource ownership, quotas/admission and lifecycle orchestration.
-2. Implement WAL/segments/checkpoints/compaction or another storage architecture that eliminates whole-database rewrite as the normal commit path; benchmark it against current engine.
-3. Add live payment provider checkout, verified provider webhook adapter, failed-payment/cancel/refund/account-management flows and real-money sandbox qualification.
-4. Enable protected `main` with required qualification checks and no direct unverified pushes.
-5. Add production TLS edge, KMS-backed key rotation/revocation, remote metrics/traces/alerts and SLO/runbook exercises.
-6. Establish 1x/10x/100x workload definitions and acceptance thresholds, then run sustained load/failure tests.
-7. Verify immutable release artifact deployment and rollback to the prior release.
+1. Implement managed project routing, isolated resource ownership, quotas/admission and lifecycle orchestration.
+2. Continue the storage architecture from WAL/checkpoints to paged/segmented state, bounded hot caches and incremental transaction write sets; qualify at 1x/10x/100x.
+3. Expand document/query/index semantics to the MongoDB-class product target while preserving the single durable change spine.
+4. Add live payment-provider checkout, provider adapter, failed-payment/cancel/refund/account-management flows and sandbox qualification.
+5. Enable protected `main` with required qualification checks.
+6. Add production TLS edge, KMS-backed key rotation/revocation, remote telemetry/alerts/SLOs and runbook exercises.
+7. Verify immutable release deployment and rollback to a prior version.
 
 ## Final launch gate
 
-Managed-cloud launch changes from **NOT READY** only when every BLOCKER is closed and independently tested. No UNVERIFIED item may be silently treated as passing.
+Managed-cloud launch changes from **NOT READY** only when every BLOCKER is closed and independently tested. No UNVERIFIED capability is treated as passing.
