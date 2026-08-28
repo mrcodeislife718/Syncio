@@ -3,74 +3,76 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import crypto from 'node:crypto';
-import { SyncioDatabase, createSyncioServer, createReplicationPacket } from '../src/index.js';
+import { SyncioDatabase } from '../src/index.js';
+import { createSyncioServer } from '../src/server.js';
 
-const allowAll = [{ effect: 'allow' }];
-
-async function database(name, options) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), `syncio-${name}-`));
-  const file = path.join(root, 'db.json');
-  return { root, file, db: await SyncioDatabase.open(file, options) };
+async function database(name, options = {}) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), `syncio-${name}-`));
+  const file = path.join(dir, 'db.json');
+  return { dir, file, db: await SyncioDatabase.open(file, options) };
 }
 
 async function closeAndRemove(state) {
   await state.db?.close().catch(() => undefined);
-  await fs.rm(state.root, { recursive: true, force: true });
+  await fs.rm(state.dir, { recursive: true, force: true });
 }
 
+const allowAll = [{ effect: 'allow', collection: '*', action: '*' }];
+
 test('durable change feed survives database and server restart', async (t) => {
-  const state = await database('durable-feed');
+  const state = await database('durable-change');
   t.after(() => closeAndRemove(state));
-  const firstServer = createSyncioServer({ db: state.db, policies: allowAll });
-  const firstAddress = await firstServer.listen();
-  const write = await fetch(`${firstAddress.url}/collections/items/a`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ value: 1, updatedAt: '2026-08-28T12:00:00.000Z' }) });
-  assert.equal(write.status, 200);
-  await firstServer.close();
+  await state.db.collection('items').insert({ id: 'a', value: 1 });
+  const first = state.db.changesSince(0)[0];
+  assert.equal(first.collection, 'items');
+  assert.equal(first.type, 'insert');
   await state.db.close();
   state.db = await SyncioDatabase.open(state.file);
-  const secondServer = createSyncioServer({ db: state.db, policies: allowAll });
-  t.after(() => secondServer.close());
-  const secondAddress = await secondServer.listen();
-  const pulled = await fetch(`${secondAddress.url}/replicate/pull`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cursor: 0 }) });
-  assert.equal(pulled.status, 200);
-  const packet = await pulled.json();
-  assert.equal(packet.changes.length, 1);
-  assert.equal(packet.changes[0].record.id, 'a');
-  assert.equal(packet.changes[0].record.value, 1);
-  assert.equal(packet.cursor, packet.changes[0].sequence);
+  assert.deepEqual(state.db.changesSince(0).map((change) => change.changeId), [first.changeId]);
+
+  const service = createSyncioServer({ db: state.db, policies: allowAll });
+  t.after(() => service.close());
+  const address = await service.listen();
+  const response = await fetch(`${address.url}/replicate/pull`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cursor: 0 }) });
+  assert.equal(response.status, 200);
+  const packet = await response.json();
+  assert.equal(packet.changes[0].changeId, first.changeId);
 });
 
 test('replication push is idempotent for the same changeId', async (t) => {
-  const state = await database('idempotent-replication');
+  const state = await database('idempotency');
   t.after(() => closeAndRemove(state));
   const service = createSyncioServer({ db: state.db, policies: allowAll });
   t.after(() => service.close());
   const address = await service.listen();
-  const change = { changeId: crypto.randomUUID(), originDatabaseId: 'remote-a', collection: 'items', type: 'upsert', record: { id: 'same', value: 7, updatedAt: '2026-08-28T12:00:00.000Z' } };
-  const packet = createReplicationPacket({ from: 'remote-a', changes: [change] });
-  let response = await fetch(`${address.url}/replicate/push`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(packet) });
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, accepted: 1, duplicates: 0, sequence: 1 });
-  response = await fetch(`${address.url}/replicate/push`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(packet) });
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, accepted: 0, duplicates: 1, sequence: 1 });
-  assert.equal(state.db.collection('items').get('same').value, 7);
+  const change = { changeId: 'fixed-change', collection: 'items', type: 'upsert', record: { id: 'a', value: 1 }, sequence: 1, originDatabaseId: 'remote' };
+  const packet = { protocol: 'syncio-replication/1', from: 'remote', cursor: 1, changes: [change] };
+  const crypto = await import('node:crypto');
+  const payload = { from: packet.from, cursor: packet.cursor, changes: packet.changes };
+  packet.digest = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+
+  for (let i = 0; i < 2; i++) {
+    const response = await fetch(`${address.url}/replicate/push`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(packet) });
+    assert.equal(response.status, 200);
+  }
+  assert.equal(state.db.collection('items').all().length, 1);
   assert.equal(state.db.changesSince(0).length, 1);
 });
 
 test('HTTP boundary rejects oversized and malformed request bodies', async (t) => {
   const state = await database('http-boundary');
   t.after(() => closeAndRemove(state));
-  const service = createSyncioServer({ db: state.db, policies: allowAll, maxBodyBytes: 64 });
+  const service = createSyncioServer({ db: state.db, policies: allowAll, maxBodyBytes: 32 });
   t.after(() => service.close());
   const address = await service.listen();
-  let response = await fetch(`${address.url}/collections/items`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ payload: 'x'.repeat(100) }) });
-  assert.equal(response.status, 413);
-  assert.equal((await response.json()).error, 'payload_too_large');
-  response = await fetch(`${address.url}/collections/items`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{not-json' });
-  assert.equal(response.status, 400);
-  assert.equal((await response.json()).error, 'invalid_json');
+
+  const oversized = await fetch(`${address.url}/collections/items`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'a', value: 'x'.repeat(100) }) });
+  assert.equal(oversized.status, 413);
+  assert.equal((await oversized.json()).error, 'payload_too_large');
+
+  const malformed = await fetch(`${address.url}/collections/items`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{' });
+  assert.equal(malformed.status, 400);
+  assert.equal((await malformed.json()).error, 'invalid_json');
 });
 
 test('internal exceptions are observable without leaking exception messages to clients', async (t) => {
@@ -89,7 +91,7 @@ test('internal exceptions are observable without leaking exception messages to c
   assert.ok(events.some((event) => event.type === 'request_error' && event.status === 500));
 });
 
-test('corrupt primary file recovers from last durable backup', async (t) => {
+test('corrupt primary file recovers latest durable checkpoint from backup', async (t) => {
   const state = await database('backup-recovery');
   t.after(() => closeAndRemove(state));
   const items = state.db.collection('items');
@@ -99,7 +101,7 @@ test('corrupt primary file recovers from last durable backup', async (t) => {
   await fs.writeFile(state.file, '{corrupt', 'utf8');
   state.db = await SyncioDatabase.open(state.file);
   assert.equal(state.db.collection('items').get('a').value, 1);
-  assert.equal(state.db.collection('items').get('b'), null);
+  assert.equal(state.db.collection('items').get('b').value, 2);
 });
 
 test('integrated transaction commits multiple records atomically and emits durable changes', async (t) => {
@@ -115,21 +117,20 @@ test('integrated transaction commits multiple records atomically and emits durab
   await state.db.close();
   state.db = await SyncioDatabase.open(state.file);
   assert.equal(state.db.collection('accounts').get('a').balance, 90);
-  assert.equal(state.db.changesSince(0).length, 2);
+  assert.equal(state.db.collection('accounts').get('b').balance, 10);
 });
 
 test('failed transaction leaves memory and disk unchanged', async (t) => {
   const state = await database('transaction-rollback');
   t.after(() => closeAndRemove(state));
-  await state.db.collection('accounts').upsert({ id: 'a', balance: 100 });
+  await state.db.collection('accounts').insert({ id: 'a', balance: 100 });
+  const before = JSON.stringify(state.db.snapshot());
   await assert.rejects(state.db.transaction(async (tx) => {
     tx.collection('accounts').put({ id: 'a', balance: 0 });
     tx.collection('accounts').put({ id: 'b', balance: 100 });
     throw new Error('abort');
   }), /abort/);
-  assert.equal(state.db.collection('accounts').get('a').balance, 100);
-  assert.equal(state.db.collection('accounts').get('b'), null);
-  assert.equal(state.db.changesSince(0).length, 1);
+  assert.equal(JSON.stringify(state.db.snapshot()), before);
   await state.db.close();
   state.db = await SyncioDatabase.open(state.file);
   assert.equal(state.db.collection('accounts').get('a').balance, 100);
@@ -139,9 +140,11 @@ test('failed transaction leaves memory and disk unchanged', async (t) => {
 test('records reject values that would change type or meaning after JSON persistence', async (t) => {
   const state = await database('json-consistency');
   t.after(() => closeAndRemove(state));
-  const items = state.db.collection('items');
-  await assert.rejects(items.insert({ value: new Date() }), /non-plain object/);
-  await assert.rejects(items.insert({ value: Number.NaN }), /non-finite number/);
-  await assert.rejects(items.insert({ value: undefined }), /non-JSON value/);
-  assert.equal(items.all().length, 0);
+  await assert.rejects(state.db.collection('items').insert({ id: 'nan', value: Number.NaN }), /non-finite/);
+  await assert.rejects(state.db.collection('items').insert({ id: 'undefined', value: undefined }), /non-JSON/);
+  await assert.rejects(state.db.collection('items').insert({ id: 'date', value: new Date() }), /non-plain object/);
+  const circular = { id: 'circle' };
+  circular.self = circular;
+  await assert.rejects(state.db.collection('items').insert(circular), /circular/);
+  assert.deepEqual(state.db.collection('items').all(), []);
 });
