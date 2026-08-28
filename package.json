@@ -7,14 +7,15 @@
     ".": "./src/index.js",
     "./operations": "./src/operations.js",
     "./control-plane": "./src/control-plane.js",
-    "./self-host": "./src/self-host.js"
+    "./self-host": "./src/self-host.js",
+    "./maintenance": "./src/maintenance.js"
   },
   "bin": {
     "syncio-server": "./bin/syncio-server.js"
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/advanced.js && node --check src/server.js && node --check src/operations.js && node --check src/control-plane.js && node --check src/self-host.js && node --check bin/syncio-server.js",
+    "check": "node --check src/index.js && node --check src/advanced.js && node --check src/server.js && node --check src/operations.js && node --check src/control-plane.js && node --check src/self-host.js && node --check src/maintenance.js && node --check bin/syncio-server.js",
     "qualify": "npm run check && npm test"
   },
   "engines": {
