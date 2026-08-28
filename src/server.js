@@ -18,12 +18,12 @@ export function createSyncioServer({
   observe = () => undefined
 } = {}) {
   if (!db) throw new Error('Syncio server requires a database');
+  if (typeof db.watchChanges !== 'function' || typeof db.resumeStatus !== 'function') throw new TypeError('Syncio server requires resumable database change streams');
   if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes < 1) throw new TypeError('maxBodyBytes must be a positive safe integer');
   if (!Number.isSafeInteger(replicationLimit) || replicationLimit < 1 || replicationLimit > 10_000) throw new TypeError('replicationLimit must be between 1 and 10000');
   if (!Number.isSafeInteger(maxSubscriptions) || maxSubscriptions < 1) throw new TypeError('maxSubscriptions must be a positive safe integer');
 
   const policy = createPolicyEngine(policies);
-  const subscriptions = new Map();
   const networkStreams = new Set();
 
   const server = http.createServer(async (req, res) => {
@@ -34,7 +34,7 @@ export function createSyncioServer({
     try {
       const url = new URL(req.url, 'http://syncio.local');
       if (req.method === 'GET' && url.pathname === '/health') {
-        return respond(res, 200, { ok: true, nodeId, sequence: db.sequence, subscriptions: networkStreams.size }, { observe, requestId, req, startedAt });
+        return respond(res, 200, { ok: true, nodeId, sequence: db.sequence, subscriptions: networkStreams.size, storage: db.storageStatus?.() }, { observe, requestId, req, startedAt });
       }
 
       const user = await authenticate(req);
@@ -44,11 +44,10 @@ export function createSyncioServer({
         if (!authorize(policy, { user, action: 'replicate', collection: '*' }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const body = await readJson(req, { maxBodyBytes });
         const cursor = normalizeCursor(body?.cursor ?? 0);
-        const retained = db.changesSince(0, { limit: 10_000 });
-        const oldestRetained = retained[0]?.sequence ?? (db.sequence + 1);
-        if (cursor < oldestRetained - 1) {
-          safeObserve(observe, { type: 'replication_cursor_expired', requestId, cursor, oldestRetained, sequence: db.sequence });
-          return respond(res, 409, { error: 'snapshot_required', requestId, cursor, oldestRetained, sequence: db.sequence }, { observe, requestId, req, startedAt });
+        const resume = db.resumeStatus(cursor);
+        if (!resume.resumable) {
+          safeObserve(observe, { type: 'replication_cursor_expired', requestId, cursor, oldestRetained: resume.oldestRetained, sequence: db.sequence });
+          return respond(res, 409, { error: cursor > db.sequence ? 'cursor_ahead' : 'snapshot_required', requestId, cursor, oldestRetained: resume.oldestRetained, sequence: db.sequence }, { observe, requestId, req, startedAt });
         }
         const changes = db.changesSince(cursor, { limit: replicationLimit });
         const nextCursor = changes.at(-1)?.sequence ?? cursor;
@@ -69,10 +68,7 @@ export function createSyncioServer({
         for (const change of body.changes) {
           const result = await applyReplicatedChange(db, change, { conflictStrategy });
           if (result?.duplicate) duplicates++;
-          else {
-            accepted++;
-            publish(subscriptions, change.collection, result?.event ?? change);
-          }
+          else accepted++;
         }
         return respond(res, 200, { ok: true, accepted, duplicates, sequence: db.sequence }, { observe, requestId, req, startedAt });
       }
@@ -80,8 +76,15 @@ export function createSyncioServer({
       if (req.method === 'GET' && parts[0] === 'subscribe' && parts[1] && !parts[2]) {
         const collectionName = decodeURIComponent(parts[1]);
         if (!authorize(policy, { user, action: 'read', collection: collectionName }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
-        if (networkStreams.size >= maxSubscriptions) return respond(res, 429, { error:'subscription_capacity_exceeded', requestId }, { observe, requestId, req, startedAt });
-        return openEventStream({ req, res, collectionName, requestId, startedAt, subscriptions, networkStreams, observe, sequence:()=>db.sequence });
+        if (networkStreams.size >= maxSubscriptions) return respond(res, 429, { error: 'subscription_capacity_exceeded', requestId }, { observe, requestId, req, startedAt });
+        const after = subscriptionCursor(req, url, db.sequence);
+        const resume = db.resumeStatus(after);
+        if (!resume.resumable) {
+          const code = after > db.sequence ? 'stream_cursor_ahead' : 'stream_resume_expired';
+          safeObserve(observe, { type: code, requestId, collection: collectionName, cursor: after, oldestRetained: resume.oldestRetained, sequence: db.sequence });
+          return respond(res, 409, { error: code, requestId, cursor: after, oldestRetained: resume.oldestRetained, sequence: db.sequence }, { observe, requestId, req, startedAt });
+        }
+        return openEventStream({ req, res, db, collectionName, after, requestId, startedAt, networkStreams, observe });
       }
 
       if (parts[0] !== 'collections' || !parts[1]) {
@@ -108,7 +111,6 @@ export function createSyncioServer({
         const body = await readJson(req, { maxBodyBytes, requireObject: true });
         if (!authorize(policy, { user, action: 'write', collection: collectionName, id, body }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const record = await collection.insert(body);
-        publishLatest(db, subscriptions, collectionName);
         return respond(res, 201, record, { observe, requestId, req, startedAt });
       }
 
@@ -116,14 +118,12 @@ export function createSyncioServer({
         const body = await readJson(req, { maxBodyBytes, requireObject: true });
         if (!authorize(policy, { user, action: 'write', collection: collectionName, id, body }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const record = await collection.upsert({ ...body, id });
-        publishLatest(db, subscriptions, collectionName);
         return respond(res, 200, record, { observe, requestId, req, startedAt });
       }
 
       if (req.method === 'DELETE' && id) {
         if (!authorize(policy, { user, action: 'delete', collection: collectionName, id }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const removed = await collection.remove(id);
-        if (removed) publishLatest(db, subscriptions, collectionName);
         return respond(res, removed ? 200 : 404, { removed }, { observe, requestId, req, startedAt });
       }
 
@@ -153,9 +153,9 @@ export function createSyncioServer({
       networkStreams.clear();
       if (server.listening) await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     },
-    subscribe(collection, listener) {
+    subscribe(collection, listener, { after = db.sequence } = {}) {
       if (typeof listener !== 'function') throw new TypeError('Syncio subscribe requires a function');
-      return addSubscription(subscriptions, collection, listener);
+      return db.watchChanges({ collection, after }, listener);
     }
   };
 }
@@ -215,7 +215,7 @@ export class ReplicationClient {
 
   async flush() {
     return this.offline.flush(async (item) => {
-      const change = item.change ? { ...item.change, changeId:item.change.changeId ?? item.idempotencyKey } : { ...item };
+      const change = item.change ? { ...item.change, changeId: item.change.changeId ?? item.idempotencyKey } : { ...item };
       delete change.queueId;
       delete change.attempts;
       delete change.idempotencyKey;
@@ -244,48 +244,50 @@ export async function applyReplicatedChange(db, change, { conflictStrategy = 'la
   return { applied: true, duplicate: false };
 }
 
-function openEventStream({ req, res, collectionName, requestId, startedAt, subscriptions, networkStreams, observe, sequence }) {
-  res.statusCode=200;
-  res.setHeader('content-type','text/event-stream; charset=utf-8');
-  res.setHeader('cache-control','no-cache, no-transform');
-  res.setHeader('connection','keep-alive');
+function openEventStream({ req, res, db, collectionName, after, requestId, startedAt, networkStreams, observe }) {
+  res.statusCode = 200;
+  res.setHeader('content-type', 'text/event-stream; charset=utf-8');
+  res.setHeader('cache-control', 'no-cache, no-transform');
+  res.setHeader('connection', 'keep-alive');
   res.flushHeaders?.();
   networkStreams.add(res);
-  let closed=false;
+  let closed = false;
   let stop;
-  const cleanup=(reason='closed')=>{
+  let heartbeat;
+  const cleanup = (reason = 'closed') => {
     if (closed) return;
-    closed=true;
-    clearInterval(heartbeat);
+    closed = true;
+    if (heartbeat) clearInterval(heartbeat);
     stop?.();
     networkStreams.delete(res);
-    safeObserve(observe,{type:'subscription_closed',requestId,collection:collectionName,reason,durationMs:Number(process.hrtime.bigint()-startedAt)/1_000_000});
+    safeObserve(observe, { type: 'subscription_closed', requestId, collection: collectionName, reason, durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000 });
   };
-  const send=(eventName,data)=>{
+  const send = (eventName, data, id) => {
     if (closed || res.writableEnded) return false;
-    const ok=res.write(`event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`);
+    const idLine = id === undefined ? '' : `id: ${id}\n`;
+    const ok = res.write(`${idLine}event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`);
     if (!ok) {
-      safeObserve(observe,{type:'subscription_backpressure',requestId,collection:collectionName});
+      safeObserve(observe, { type: 'subscription_backpressure', requestId, collection: collectionName });
       cleanup('backpressure');
       res.end();
       return false;
     }
     return true;
   };
-  stop=addSubscription(subscriptions,collectionName,(change)=>send('change',change));
-  const heartbeat=setInterval(()=>send('heartbeat',{sequence:sequence()}),15_000);
+  heartbeat = setInterval(() => send('heartbeat', { sequence: db.sequence }), 15_000);
   heartbeat.unref?.();
-  req.once('close',()=>cleanup('client_closed'));
-  res.once('close',()=>cleanup('response_closed'));
-  send('ready',{collection:collectionName,sequence:sequence(),requestId});
-  safeObserve(observe,{type:'subscription_opened',requestId,collection:collectionName});
+  req.once('close', () => cleanup('client_closed'));
+  res.once('close', () => cleanup('response_closed'));
+  send('ready', { collection: collectionName, sequence: db.sequence, resumeFrom: after, requestId });
+  stop = db.watchChanges({ collection: collectionName, after }, (change) => send('change', change, change.sequence));
+  safeObserve(observe, { type: 'subscription_opened', requestId, collection: collectionName, resumeFrom: after });
 }
 
-function addSubscription(subscriptions, collection, listener) {
-  const set=subscriptions.get(collection)??new Set();
-  set.add(listener);
-  subscriptions.set(collection,set);
-  return ()=>{set.delete(listener);if(!set.size)subscriptions.delete(collection);};
+function subscriptionCursor(req, url, currentSequence) {
+  if (url.searchParams.has('after')) return normalizeCursor(url.searchParams.get('after'));
+  const lastEventId = req.headers['last-event-id'];
+  if (typeof lastEventId === 'string' && lastEventId.length) return normalizeCursor(lastEventId);
+  return currentSequence;
 }
 
 function cloneSnapshotState(state) {
@@ -297,16 +299,6 @@ function authorize(policy, context, res, requestId) {
   const allowed = policy.authorize(context);
   if (!allowed) json(res, 403, { error: 'forbidden', requestId });
   return allowed;
-}
-
-function publishLatest(db, subscriptions, collection) {
-  const change = db.changesSince(Math.max(0, db.sequence - 1), { limit: 1 })[0];
-  publish(subscriptions, collection, change);
-}
-
-function publish(subscriptions, collection, change) {
-  if (!change) return;
-  for (const listener of subscriptions.get(collection) ?? []) queueMicrotask(() => listener(structuredClone(change)));
 }
 
 function parseQuery(url) {
@@ -375,7 +367,7 @@ function finishObserved(observe, requestId, req, res, startedAt) {
 }
 
 function safeObserve(observe, event) {
-  try { observe(Object.freeze({ ...event })); } catch { /* observability must not take down the data plane */ }
+  try { observe(Object.freeze({ ...event })); } catch { }
 }
 
 function json(res, status, body) {
