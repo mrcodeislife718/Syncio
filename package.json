@@ -1,11 +1,16 @@
 {
   "name": "syncio-db",
-  "version": "0.1.0",
-  "description": "Syncio embedded realtime database core.",
+  "version": "0.2.0",
+  "description": "Syncio local-first realtime database and production operations core.",
   "type": "module",
-  "exports": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./operations": "./src/operations.js"
+  },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/advanced.js && node --check src/server.js && node --check src/operations.js",
+    "qualify": "npm run check && npm test"
   },
   "engines": {
     "node": ">=20"
