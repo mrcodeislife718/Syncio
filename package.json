@@ -15,11 +15,12 @@
     "./billing": "./src/billing.js"
   },
   "bin": {
-    "syncio-server": "./bin/syncio-server.js"
+    "syncio-server": "./bin/syncio-server.js",
+    "syncio-control": "./bin/syncio-control.js"
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/advanced.js && node --check src/server.js && node --check src/operations.js && node --check src/control-plane.js && node --check src/hosted-control.js && node --check src/self-host.js && node --check src/maintenance.js && node --check src/indexed.js && node --check src/resource-control.js && node --check src/billing.js && node --check bin/syncio-server.js && node --check scripts/closure-audit.mjs && node --check scripts/benchmark.mjs",
+    "check": "node --check src/index.js && node --check src/advanced.js && node --check src/server.js && node --check src/operations.js && node --check src/control-plane.js && node --check src/hosted-control.js && node --check src/self-host.js && node --check src/maintenance.js && node --check src/indexed.js && node --check src/resource-control.js && node --check src/billing.js && node --check bin/syncio-server.js && node --check bin/syncio-control.js && node --check scripts/closure-audit.mjs && node --check scripts/benchmark.mjs",
     "audit:closure": "node scripts/closure-audit.mjs",
     "benchmark": "node scripts/benchmark.mjs",
     "qualify": "npm run check && npm run audit:closure && npm test"
