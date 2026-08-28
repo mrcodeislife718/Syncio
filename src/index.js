@@ -18,6 +18,7 @@ export class SyncioDatabase {
     this.file = file;
     this.state = normalizeState(state);
     this.listeners = new Map();
+    this.changeListeners = new Set();
     this.writeQueue = Promise.resolve();
     this.changeRetention = changeRetention;
     this.checkpointEvery = checkpointEvery;
@@ -122,18 +123,85 @@ export class SyncioDatabase {
       const result = await work(createTransactionApi(draft.collections));
       const changes = diffCollections(before, draft.collections);
       const events = changes.map((change) => this.#appendChange(draft, change));
-      if (events.length) await this.#commitDraft(draft, events);
+      if (events.length) {
+        await this.#commitDraft(draft, events);
+        for (const event of events) this.#publish(event.collection, event);
+      }
       return result;
     });
   }
 
-  changesSince(cursor = 0, { limit = 1_000 } = {}) {
+  changesSince(cursor = 0, { limit = 1_000, collection } = {}) {
     if (!Number.isSafeInteger(cursor) || cursor < 0) throw new TypeError('Syncio change cursor must be a non-negative safe integer');
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new TypeError('Syncio change limit must be between 1 and 10000');
+    if (collection !== undefined) validateCollectionName(collection);
     return this.state._syncio.changes
-      .filter((change) => change.sequence > cursor)
+      .filter((change) => change.sequence > cursor && (collection === undefined || change.collection === collection))
       .slice(0, limit)
       .map((change) => structuredClone(change));
+  }
+
+  resumeStatus(cursor = 0) {
+    if (!Number.isSafeInteger(cursor) || cursor < 0) throw new TypeError('Syncio change cursor must be a non-negative safe integer');
+    const oldestRetained = this.state._syncio.changes[0]?.sequence ?? (this.sequence + 1);
+    return Object.freeze({
+      cursor,
+      sequence: this.sequence,
+      oldestRetained,
+      resumable: cursor >= oldestRetained - 1 && cursor <= this.sequence
+    });
+  }
+
+  watchChanges({ collection, after = this.sequence } = {}, listener) {
+    if (collection !== undefined) validateCollectionName(collection);
+    if (!Number.isSafeInteger(after) || after < 0) throw new TypeError('Syncio watch cursor must be a non-negative safe integer');
+    if (typeof listener !== 'function') throw new TypeError('Syncio watchChanges requires a function');
+    const status = this.resumeStatus(after);
+    if (!status.resumable) {
+      const error = new Error(after > this.sequence ? 'Syncio change cursor is ahead of the database' : 'Syncio change cursor has expired');
+      error.code = after > this.sequence ? 'SYNCIO_CURSOR_AHEAD' : 'SYNCIO_CURSOR_EXPIRED';
+      error.details = status;
+      throw error;
+    }
+
+    let active = true;
+    let lastSequence = after;
+    const buffered = [];
+    const live = (event) => {
+      if (!active || event.sequence <= lastSequence) return;
+      if (collection !== undefined && event.collection !== collection) return;
+      buffered.push(structuredClone(event));
+    };
+    this.changeListeners.add(live);
+
+    const highWater = this.sequence;
+    const replay = this.changesSince(after, { limit: 10_000, collection }).filter((event) => event.sequence <= highWater);
+    for (const event of replay) {
+      if (!active) break;
+      lastSequence = event.sequence;
+      listener(structuredClone(event));
+    }
+    buffered.sort((a, b) => a.sequence - b.sequence);
+    for (const event of buffered) {
+      if (!active || event.sequence <= lastSequence) continue;
+      lastSequence = event.sequence;
+      listener(structuredClone(event));
+    }
+    buffered.length = 0;
+
+    this.changeListeners.delete(live);
+    const direct = (event) => {
+      if (!active || event.sequence <= lastSequence) return;
+      if (collection !== undefined && event.collection !== collection) return;
+      lastSequence = event.sequence;
+      listener(structuredClone(event));
+    };
+    this.changeListeners.add(direct);
+    return () => {
+      active = false;
+      this.changeListeners.delete(live);
+      this.changeListeners.delete(direct);
+    };
   }
 
   hasAppliedChange(changeId) {
@@ -274,6 +342,7 @@ export class SyncioDatabase {
   #publish(collection, event) {
     const payload = structuredClone(event);
     for (const listener of this.listeners.get(collection) ?? []) queueMicrotask(() => listener(structuredClone(payload)));
+    for (const listener of this.changeListeners) queueMicrotask(() => listener(structuredClone(payload)));
   }
 }
 
@@ -457,22 +526,24 @@ async function readStateWithRecovery(target) {
 async function atomicWriteJson(target, value) {
   await fs.mkdir(path.dirname(target), { recursive: true });
   const temp = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  const backupTemp = `${target}.bak.${process.pid}.${crypto.randomUUID()}.tmp`;
   const data = `${JSON.stringify(value, null, 2)}\n`;
   try {
     await fs.writeFile(temp, data, { encoding: 'utf8', mode: 0o600 });
     const tempHandle = await fs.open(temp, 'r');
     try { await tempHandle.sync(); } finally { await tempHandle.close(); }
-    try {
-      await fs.copyFile(target, `${target}.bak`);
-      const backupHandle = await fs.open(`${target}.bak`, 'r');
-      try { await backupHandle.sync(); } finally { await backupHandle.close(); }
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
     await fs.rename(temp, target);
     const directoryHandle = await fs.open(path.dirname(target), 'r');
     try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+
+    await fs.writeFile(backupTemp, data, { encoding: 'utf8', mode: 0o600 });
+    const backupHandle = await fs.open(backupTemp, 'r');
+    try { await backupHandle.sync(); } finally { await backupHandle.close(); }
+    await fs.rename(backupTemp, `${target}.bak`);
+    const backupDirectoryHandle = await fs.open(path.dirname(target), 'r');
+    try { await backupDirectoryHandle.sync(); } finally { await backupDirectoryHandle.close(); }
   } finally {
     await fs.rm(temp, { force: true }).catch(() => undefined);
+    await fs.rm(backupTemp, { force: true }).catch(() => undefined);
   }
 }
