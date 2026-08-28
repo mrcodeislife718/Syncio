@@ -2,6 +2,7 @@ import path from 'node:path';
 import { IndexedSyncioDatabase } from './indexed.js';
 import { createSyncioServer } from './server.js';
 import { createTokenAuthority, MetricsRegistry, AuditLog } from './operations.js';
+import { TokenBucketLimiter, rateLimitError } from './resource-control.js';
 
 export async function startSelfHostedSyncio({
   file,
@@ -10,11 +11,13 @@ export async function startSelfHostedSyncio({
   host = '127.0.0.1',
   port = 8787,
   auditFile = `${file}.audit.ndjson`,
-  tokenTtlSeconds = 3600
+  tokenTtlSeconds = 3600,
+  rateLimit = { capacity: 240, refillPerSecond: 4, maxKeys: 10_000 }
 } = {}) {
   if (!file) throw new TypeError('self-hosted Syncio requires file');
   if (!projectId || typeof projectId !== 'string') throw new TypeError('self-hosted Syncio requires projectId');
   const authority = createTokenAuthority(secret, { issuer:`syncio:${projectId}`, ttlSeconds:tokenTtlSeconds });
+  const limiter = new TokenBucketLimiter(rateLimit);
   const db = await IndexedSyncioDatabase.open(path.resolve(file));
   const metrics = new MetricsRegistry();
   const audit = new AuditLog(path.resolve(auditFile));
@@ -26,6 +29,10 @@ export async function startSelfHostedSyncio({
     }
   };
   const authenticate = async (req) => {
+    const token = req?.headers?.authorization ?? '';
+    const identity = `${req?.socket?.remoteAddress ?? 'unknown'}:${typeof token === 'string' ? token.slice(-24) : ''}`;
+    const decision = limiter.consume(identity);
+    if (!decision.allowed) throw rateLimitError(decision);
     const user = authority.authenticateRequest(req);
     return user?.projectId === projectId ? user : null;
   };
@@ -42,6 +49,7 @@ export async function startSelfHostedSyncio({
     db,
     metrics,
     audit,
+    limiter,
     issueToken({ subject='operator', role='owner', entitlements=['database','realtime'] } = {}) {
       return authority.issue({ subject, projectId, role, entitlements });
     },
