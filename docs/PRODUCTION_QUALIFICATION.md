@@ -17,7 +17,7 @@ Qualification posture: attempt to prove the product is **not** ready. Untested c
 | Formatting | UNVERIFIED | No formatter gate is defined. |
 | Type checking | UNVERIFIED | JavaScript runtime validation is extensive; no static type system is configured. |
 | Unit tests | PASS | Node test runner covers core utilities and policies. |
-| Integration tests | PASS | Real filesystem and HTTP tests cover persistence, replication, auth, hosted control and self-host operation. |
+| Integration tests | PASS | Real filesystem and HTTP tests cover persistence, replication, auth, hosted control, indexed HTTP queries and self-host operation. |
 | Contract tests | PASS | Replication/snapshot digests, billing webhook signatures, token canonicalization and policy contracts are tested. |
 | Database tests | PASS | Restart durability, transaction rollback, contention, indexes and corruption recovery. |
 | Migration tests | PASS | Backup-gated migration, failed migration and rollback. |
@@ -43,7 +43,7 @@ Qualification posture: attempt to prove the product is **not** ready. Untested c
 
 ## Realistic failure coverage
 
-PASS: process/database reopen, corrupt primary snapshot with valid backup, duplicate mutation, duplicate replication change, network/offline send failure, replication history expiry, tampered replication snapshot, failed transaction, failed migration, malformed JSON, oversized request body, unauthorized request, stale entitlement after downgrade, duplicate billing event, tampered/expired billing webhook, SSE capacity exhaustion, token signature encoding ambiguity.
+PASS: process/database reopen, corrupt primary snapshot with valid backup, duplicate mutation, duplicate replication change, network/offline send failure, replication history expiry, tampered replication snapshot, failed transaction, failed migration, malformed JSON, oversized request body, unauthorized request, stale entitlement after downgrade, duplicate billing event, tampered/expired billing webhook, SSE capacity exhaustion, token signature encoding ambiguity, HTTP indexed-query planner integration.
 
 UNVERIFIED: host disk full, filesystem read-only transition, OS kill at every fsync/rename boundary, multi-machine partition with simultaneous conflicting writes beyond current LWW tests, remote object-store outage, managed queue outage, KMS outage/rotation, TLS certificate failure, production payment provider outage, distributed rate-limit state loss, multi-region failover.
 
@@ -78,7 +78,7 @@ CI additionally issues a token from the built image, proves an anonymous data re
 
 ## Nonblocking defects / limitations
 
-- HTTP list queries do not yet prove use of the persistent query planner/index path.
+- HTTP equality queries now prove use of the persistent query planner/index path when eligible; broader compound/range planner optimization remains a performance opportunity, not a correctness gap.
 - SSE provides live changes but no reconnect cursor/replay contract.
 - LWW conflict resolution is deterministic but limited.
 - In-memory metrics are not a production telemetry backend.
