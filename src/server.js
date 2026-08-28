@@ -1,9 +1,10 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { OfflineQueue, createPolicyEngine, createReplicationPacket, verifyReplicationPacket, resolveConflict, queryRecords } from './advanced.js';
+import { OfflineQueue, createPolicyEngine, createReplicationPacket, verifyReplicationPacket, createSnapshotPacket, verifySnapshotPacket, resolveConflict, queryRecords } from './advanced.js';
 
 const DEFAULT_MAX_BODY_BYTES = 1_048_576;
 const DEFAULT_REPLICATION_LIMIT = 1_000;
+const DEFAULT_MAX_SUBSCRIPTIONS = 1_000;
 
 export function createSyncioServer({
   db,
@@ -13,14 +14,17 @@ export function createSyncioServer({
   conflictStrategy = 'last-write-wins',
   maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
   replicationLimit = DEFAULT_REPLICATION_LIMIT,
+  maxSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS,
   observe = () => undefined
 } = {}) {
   if (!db) throw new Error('Syncio server requires a database');
+  if (typeof db.watchChanges !== 'function' || typeof db.resumeStatus !== 'function') throw new TypeError('Syncio server requires resumable database change streams');
   if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes < 1) throw new TypeError('maxBodyBytes must be a positive safe integer');
   if (!Number.isSafeInteger(replicationLimit) || replicationLimit < 1 || replicationLimit > 10_000) throw new TypeError('replicationLimit must be between 1 and 10000');
+  if (!Number.isSafeInteger(maxSubscriptions) || maxSubscriptions < 1) throw new TypeError('maxSubscriptions must be a positive safe integer');
 
   const policy = createPolicyEngine(policies);
-  const subscriptions = new Map();
+  const networkStreams = new Set();
 
   const server = http.createServer(async (req, res) => {
     const requestId = requestIdFor(req);
@@ -30,7 +34,7 @@ export function createSyncioServer({
     try {
       const url = new URL(req.url, 'http://syncio.local');
       if (req.method === 'GET' && url.pathname === '/health') {
-        return respond(res, 200, { ok: true, nodeId, sequence: db.sequence }, { observe, requestId, req, startedAt });
+        return respond(res, 200, { ok: true, nodeId, sequence: db.sequence, subscriptions: networkStreams.size, storage: db.storageStatus?.() }, { observe, requestId, req, startedAt });
       }
 
       const user = await authenticate(req);
@@ -40,9 +44,19 @@ export function createSyncioServer({
         if (!authorize(policy, { user, action: 'replicate', collection: '*' }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const body = await readJson(req, { maxBodyBytes });
         const cursor = normalizeCursor(body?.cursor ?? 0);
+        const resume = db.resumeStatus(cursor);
+        if (!resume.resumable) {
+          safeObserve(observe, { type: 'replication_cursor_expired', requestId, cursor, oldestRetained: resume.oldestRetained, sequence: db.sequence });
+          return respond(res, 409, { error: cursor > db.sequence ? 'cursor_ahead' : 'snapshot_required', requestId, cursor, oldestRetained: resume.oldestRetained, sequence: db.sequence }, { observe, requestId, req, startedAt });
+        }
         const changes = db.changesSince(cursor, { limit: replicationLimit });
         const nextCursor = changes.at(-1)?.sequence ?? cursor;
         return respond(res, 200, createReplicationPacket({ from: nodeId, cursor: nextCursor, changes }), { observe, requestId, req, startedAt });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/replicate/snapshot') {
+        if (!authorize(policy, { user, action: 'replicate', collection: '*' }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
+        return respond(res, 200, createSnapshotPacket({ from: nodeId, cursor: db.sequence, state: db.snapshot() }), { observe, requestId, req, startedAt });
       }
 
       if (req.method === 'POST' && url.pathname === '/replicate/push') {
@@ -54,12 +68,23 @@ export function createSyncioServer({
         for (const change of body.changes) {
           const result = await applyReplicatedChange(db, change, { conflictStrategy });
           if (result?.duplicate) duplicates++;
-          else {
-            accepted++;
-            publish(subscriptions, change.collection, result?.event ?? change);
-          }
+          else accepted++;
         }
         return respond(res, 200, { ok: true, accepted, duplicates, sequence: db.sequence }, { observe, requestId, req, startedAt });
+      }
+
+      if (req.method === 'GET' && parts[0] === 'subscribe' && parts[1] && !parts[2]) {
+        const collectionName = decodeURIComponent(parts[1]);
+        if (!authorize(policy, { user, action: 'read', collection: collectionName }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
+        if (networkStreams.size >= maxSubscriptions) return respond(res, 429, { error: 'subscription_capacity_exceeded', requestId }, { observe, requestId, req, startedAt });
+        const after = subscriptionCursor(req, url, db.sequence);
+        const resume = db.resumeStatus(after);
+        if (!resume.resumable) {
+          const code = after > db.sequence ? 'stream_cursor_ahead' : 'stream_resume_expired';
+          safeObserve(observe, { type: code, requestId, collection: collectionName, cursor: after, oldestRetained: resume.oldestRetained, sequence: db.sequence });
+          return respond(res, 409, { error: code, requestId, cursor: after, oldestRetained: resume.oldestRetained, sequence: db.sequence }, { observe, requestId, req, startedAt });
+        }
+        return openEventStream({ req, res, db, collectionName, after, requestId, startedAt, networkStreams, observe });
       }
 
       if (parts[0] !== 'collections' || !parts[1]) {
@@ -86,7 +111,6 @@ export function createSyncioServer({
         const body = await readJson(req, { maxBodyBytes, requireObject: true });
         if (!authorize(policy, { user, action: 'write', collection: collectionName, id, body }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const record = await collection.insert(body);
-        publishLatest(db, subscriptions, collectionName);
         return respond(res, 201, record, { observe, requestId, req, startedAt });
       }
 
@@ -94,14 +118,12 @@ export function createSyncioServer({
         const body = await readJson(req, { maxBodyBytes, requireObject: true });
         if (!authorize(policy, { user, action: 'write', collection: collectionName, id, body }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const record = await collection.upsert({ ...body, id });
-        publishLatest(db, subscriptions, collectionName);
         return respond(res, 200, record, { observe, requestId, req, startedAt });
       }
 
       if (req.method === 'DELETE' && id) {
         if (!authorize(policy, { user, action: 'delete', collection: collectionName, id }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const removed = await collection.remove(id);
-        if (removed) publishLatest(db, subscriptions, collectionName);
         return respond(res, removed ? 200 : 404, { removed }, { observe, requestId, req, startedAt });
       }
 
@@ -127,32 +149,49 @@ export function createSyncioServer({
       return { host, port: address.port, url: `http://${host}:${address.port}` };
     },
     async close() {
+      for (const stream of [...networkStreams]) stream.end();
+      networkStreams.clear();
       if (server.listening) await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     },
-    subscribe(collection, listener) {
+    subscribe(collection, listener, { after = db.sequence } = {}) {
       if (typeof listener !== 'function') throw new TypeError('Syncio subscribe requires a function');
-      const set = subscriptions.get(collection) ?? new Set();
-      set.add(listener);
-      subscriptions.set(collection, set);
-      return () => { set.delete(listener); if (!set.size) subscriptions.delete(collection); };
+      return db.watchChanges({ collection, after }, listener);
     }
   };
 }
 
 export class ReplicationClient {
-  constructor({ baseUrl, nodeId = crypto.randomUUID(), fetchImpl = globalThis.fetch, cursor = 0 } = {}) {
+  constructor({ baseUrl, nodeId = crypto.randomUUID(), fetchImpl = globalThis.fetch, cursor = 0, offlineQueue = new OfflineQueue() } = {}) {
     if (!baseUrl) throw new TypeError('ReplicationClient requires baseUrl');
     if (typeof fetchImpl !== 'function') throw new TypeError('ReplicationClient requires fetch');
+    if (!offlineQueue || typeof offlineQueue.enqueue !== 'function' || typeof offlineQueue.flush !== 'function') throw new TypeError('ReplicationClient offlineQueue must implement enqueue and flush');
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.nodeId = nodeId;
     this.fetch = fetchImpl;
-    this.offline = new OfflineQueue();
+    this.offline = offlineQueue;
     this.cursor = normalizeCursor(cursor);
   }
 
-  async pull(apply) {
+  async pull(apply, { reseed } = {}) {
     if (typeof apply !== 'function') throw new TypeError('ReplicationClient.pull requires apply callback');
-    const response = await this.fetch(`${this.baseUrl}/replicate/pull`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cursor: this.cursor }) });
+    let response = await this.fetch(`${this.baseUrl}/replicate/pull`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cursor: this.cursor }) });
+    if (response.status === 409) {
+      const problem = await response.json().catch(() => ({}));
+      if (problem.error !== 'snapshot_required') throw new Error('replication pull conflict');
+      if (typeof reseed !== 'function') {
+        const error = new Error('replication cursor expired; snapshot reseed required');
+        error.code = 'SYNCIO_SNAPSHOT_REQUIRED';
+        error.details = problem;
+        throw error;
+      }
+      response = await this.fetch(`${this.baseUrl}/replicate/snapshot`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      if (!response.ok) throw new Error(`replication snapshot failed: ${response.status}`);
+      const snapshot = await response.json();
+      if (!verifySnapshotPacket(snapshot)) throw new Error('server returned invalid snapshot packet');
+      await reseed(cloneSnapshotState(snapshot.state));
+      this.cursor = normalizeCursor(snapshot.cursor);
+      return 0;
+    }
     if (!response.ok) throw new Error(`replication pull failed: ${response.status}`);
     const packet = await response.json();
     if (!verifyReplicationPacket(packet)) throw new Error('server returned invalid replication packet');
@@ -161,13 +200,27 @@ export class ReplicationClient {
     return packet.changes?.length ?? 0;
   }
 
+  async reseedDatabase(db) {
+    if (!db || typeof db.replaceState !== 'function') throw new TypeError('reseedDatabase requires Syncio-compatible database');
+    const response = await this.fetch(`${this.baseUrl}/replicate/snapshot`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    if (!response.ok) throw new Error(`replication snapshot failed: ${response.status}`);
+    const snapshot = await response.json();
+    if (!verifySnapshotPacket(snapshot)) throw new Error('server returned invalid snapshot packet');
+    await db.replaceState(cloneSnapshotState(snapshot.state));
+    this.cursor = normalizeCursor(snapshot.cursor);
+    return this.cursor;
+  }
+
   queue(change) { return this.offline.enqueue(change); }
 
   async flush() {
     return this.offline.flush(async (item) => {
-      const change = { ...item };
+      const change = item.change ? { ...item.change, changeId: item.change.changeId ?? item.idempotencyKey } : { ...item };
       delete change.queueId;
       delete change.attempts;
+      delete change.idempotencyKey;
+      delete change.enqueuedAt;
+      delete change.lastAttemptAt;
       change.changeId ??= crypto.randomUUID();
       const packet = createReplicationPacket({ from: this.nodeId, cursor: this.cursor, changes: [change] });
       const response = await this.fetch(`${this.baseUrl}/replicate/push`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(packet) });
@@ -191,20 +244,61 @@ export async function applyReplicatedChange(db, change, { conflictStrategy = 'la
   return { applied: true, duplicate: false };
 }
 
+function openEventStream({ req, res, db, collectionName, after, requestId, startedAt, networkStreams, observe }) {
+  res.statusCode = 200;
+  res.setHeader('content-type', 'text/event-stream; charset=utf-8');
+  res.setHeader('cache-control', 'no-cache, no-transform');
+  res.setHeader('connection', 'keep-alive');
+  res.flushHeaders?.();
+  networkStreams.add(res);
+  let closed = false;
+  let stop;
+  let heartbeat;
+  const cleanup = (reason = 'closed') => {
+    if (closed) return;
+    closed = true;
+    if (heartbeat) clearInterval(heartbeat);
+    stop?.();
+    networkStreams.delete(res);
+    safeObserve(observe, { type: 'subscription_closed', requestId, collection: collectionName, reason, durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000 });
+  };
+  const send = (eventName, data, id) => {
+    if (closed || res.writableEnded) return false;
+    const idLine = id === undefined ? '' : `id: ${id}\n`;
+    const ok = res.write(`${idLine}event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`);
+    if (!ok) {
+      safeObserve(observe, { type: 'subscription_backpressure', requestId, collection: collectionName });
+      cleanup('backpressure');
+      res.end();
+      return false;
+    }
+    return true;
+  };
+  heartbeat = setInterval(() => send('heartbeat', { sequence: db.sequence }), 15_000);
+  heartbeat.unref?.();
+  req.once('close', () => cleanup('client_closed'));
+  res.once('close', () => cleanup('response_closed'));
+  send('ready', { collection: collectionName, sequence: db.sequence, resumeFrom: after, requestId });
+  stop = db.watchChanges({ collection: collectionName, after }, (change) => send('change', change, change.sequence));
+  safeObserve(observe, { type: 'subscription_opened', requestId, collection: collectionName, resumeFrom: after });
+}
+
+function subscriptionCursor(req, url, currentSequence) {
+  if (url.searchParams.has('after')) return normalizeCursor(url.searchParams.get('after'));
+  const lastEventId = req.headers['last-event-id'];
+  if (typeof lastEventId === 'string' && lastEventId.length) return normalizeCursor(lastEventId);
+  return currentSequence;
+}
+
+function cloneSnapshotState(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) throw new TypeError('snapshot state must be an object');
+  return { version: state.version ?? 1, collections: structuredClone(state.collections ?? {}) };
+}
+
 function authorize(policy, context, res, requestId) {
   const allowed = policy.authorize(context);
   if (!allowed) json(res, 403, { error: 'forbidden', requestId });
   return allowed;
-}
-
-function publishLatest(db, subscriptions, collection) {
-  const change = db.changesSince(Math.max(0, db.sequence - 1), { limit: 1 })[0];
-  publish(subscriptions, collection, change);
-}
-
-function publish(subscriptions, collection, change) {
-  if (!change) return;
-  for (const listener of subscriptions.get(collection) ?? []) queueMicrotask(() => listener(structuredClone(change)));
 }
 
 function parseQuery(url) {
@@ -273,7 +367,7 @@ function finishObserved(observe, requestId, req, res, startedAt) {
 }
 
 function safeObserve(observe, event) {
-  try { observe(Object.freeze({ ...event })); } catch { /* observability must not take down the data plane */ }
+  try { observe(Object.freeze({ ...event })); } catch { }
 }
 
 function json(res, status, body) {

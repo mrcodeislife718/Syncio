@@ -12,6 +12,7 @@ export class QueryIndex {
 }
 
 export function queryRecords(records, spec = {}) {
+  if (records && typeof records.__syncioQuery === 'function') return records.__syncioQuery(spec);
   let output = [...records];
   if (spec.where) output = output.filter((record) => matchWhere(record, spec.where));
   if (spec.orderBy) {

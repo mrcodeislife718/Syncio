@@ -2,29 +2,61 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { WriteAheadLog } from './wal.js';
 export * from './advanced.js';
 export * from './server.js';
+export * from './wal.js';
 
 const DEFAULT_CHANGE_RETENTION = 10_000;
+const DEFAULT_CHECKPOINT_EVERY = 256;
 
 export class SyncioDatabase {
-  constructor(file, state, { changeRetention = DEFAULT_CHANGE_RETENTION } = {}) {
+  constructor(file, state, { changeRetention = DEFAULT_CHANGE_RETENTION, checkpointEvery = DEFAULT_CHECKPOINT_EVERY, wal } = {}) {
     if (!Number.isSafeInteger(changeRetention) || changeRetention < 1) throw new TypeError('changeRetention must be a positive safe integer');
+    if (!Number.isSafeInteger(checkpointEvery) || checkpointEvery < 1) throw new TypeError('checkpointEvery must be a positive safe integer');
+    if (!(wal instanceof WriteAheadLog)) throw new TypeError('Syncio database requires a WriteAheadLog');
     this.file = file;
     this.state = normalizeState(state);
     this.listeners = new Map();
+    this.changeListeners = new Set();
     this.writeQueue = Promise.resolve();
     this.changeRetention = changeRetention;
+    this.checkpointEvery = checkpointEvery;
+    this.wal = wal;
+    this.commitsSinceCheckpoint = 0;
+    this.lastCheckpointError = null;
   }
 
   static async open(file, options = {}) {
     const target = path.resolve(file);
-    const state = await readStateWithRecovery(target);
-    return new SyncioDatabase(target, state, options);
+    const loaded = await readStateWithRecovery(target);
+    let state = normalizeState(loaded.state);
+    if (!loaded.exists) await atomicWriteJson(target, state);
+    const checkpointSequence = state._syncio.sequence;
+    const wal = await WriteAheadLog.open(`${target}.wal`);
+    const replayEntries = wal.listAfter(checkpointSequence);
+    state = replayWal(state, replayEntries, options.changeRetention ?? DEFAULT_CHANGE_RETENTION);
+    const db = new SyncioDatabase(target, state, { ...options, wal });
+    db.commitsSinceCheckpoint = replayEntries.length;
+    return db;
   }
 
   get databaseId() { return this.state._syncio.databaseId; }
   get sequence() { return this.state._syncio.sequence; }
+
+  storageStatus() {
+    return Object.freeze({
+      mode: 'wal-checkpoint',
+      checkpointEvery: this.checkpointEvery,
+      commitsSinceCheckpoint: this.commitsSinceCheckpoint,
+      walEntries: this.wal.entries.length,
+      degraded: Boolean(this.lastCheckpointError),
+      checkpointError: this.lastCheckpointError ? {
+        code: this.lastCheckpointError.code ?? 'CHECKPOINT_FAILED',
+        message: this.lastCheckpointError.message
+      } : null
+    });
+  }
 
   collection(name) {
     validateCollectionName(name);
@@ -91,20 +123,85 @@ export class SyncioDatabase {
       const result = await work(createTransactionApi(draft.collections));
       const changes = diffCollections(before, draft.collections);
       const events = changes.map((change) => this.#appendChange(draft, change));
-      await atomicWriteJson(this.file, draft);
-      this.state = draft;
-      for (const event of events) this.#publish(event.collection, event);
+      if (events.length) {
+        await this.#commitDraft(draft, events);
+        for (const event of events) this.#publish(event.collection, event);
+      }
       return result;
     });
   }
 
-  changesSince(cursor = 0, { limit = 1_000 } = {}) {
+  changesSince(cursor = 0, { limit = 1_000, collection } = {}) {
     if (!Number.isSafeInteger(cursor) || cursor < 0) throw new TypeError('Syncio change cursor must be a non-negative safe integer');
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new TypeError('Syncio change limit must be between 1 and 10000');
+    if (collection !== undefined) validateCollectionName(collection);
     return this.state._syncio.changes
-      .filter((change) => change.sequence > cursor)
+      .filter((change) => change.sequence > cursor && (collection === undefined || change.collection === collection))
       .slice(0, limit)
       .map((change) => structuredClone(change));
+  }
+
+  resumeStatus(cursor = 0) {
+    if (!Number.isSafeInteger(cursor) || cursor < 0) throw new TypeError('Syncio change cursor must be a non-negative safe integer');
+    const oldestRetained = this.state._syncio.changes[0]?.sequence ?? (this.sequence + 1);
+    return Object.freeze({
+      cursor,
+      sequence: this.sequence,
+      oldestRetained,
+      resumable: cursor >= oldestRetained - 1 && cursor <= this.sequence
+    });
+  }
+
+  watchChanges({ collection, after = this.sequence } = {}, listener) {
+    if (collection !== undefined) validateCollectionName(collection);
+    if (!Number.isSafeInteger(after) || after < 0) throw new TypeError('Syncio watch cursor must be a non-negative safe integer');
+    if (typeof listener !== 'function') throw new TypeError('Syncio watchChanges requires a function');
+    const status = this.resumeStatus(after);
+    if (!status.resumable) {
+      const error = new Error(after > this.sequence ? 'Syncio change cursor is ahead of the database' : 'Syncio change cursor has expired');
+      error.code = after > this.sequence ? 'SYNCIO_CURSOR_AHEAD' : 'SYNCIO_CURSOR_EXPIRED';
+      error.details = status;
+      throw error;
+    }
+
+    let active = true;
+    let lastSequence = after;
+    const buffered = [];
+    const live = (event) => {
+      if (!active || event.sequence <= lastSequence) return;
+      if (collection !== undefined && event.collection !== collection) return;
+      buffered.push(structuredClone(event));
+    };
+    this.changeListeners.add(live);
+
+    const highWater = this.sequence;
+    const replay = this.changesSince(after, { limit: 10_000, collection }).filter((event) => event.sequence <= highWater);
+    for (const event of replay) {
+      if (!active) break;
+      lastSequence = event.sequence;
+      listener(structuredClone(event));
+    }
+    buffered.sort((a, b) => a.sequence - b.sequence);
+    for (const event of buffered) {
+      if (!active || event.sequence <= lastSequence) continue;
+      lastSequence = event.sequence;
+      listener(structuredClone(event));
+    }
+    buffered.length = 0;
+
+    this.changeListeners.delete(live);
+    const direct = (event) => {
+      if (!active || event.sequence <= lastSequence) return;
+      if (collection !== undefined && event.collection !== collection) return;
+      lastSequence = event.sequence;
+      listener(structuredClone(event));
+    };
+    this.changeListeners.add(direct);
+    return () => {
+      active = false;
+      this.changeListeners.delete(live);
+      this.changeListeners.delete(direct);
+    };
   }
 
   hasAppliedChange(changeId) {
@@ -144,8 +241,7 @@ export class SyncioDatabase {
         source: 'replication',
         receivedAt: new Date().toISOString()
       }, { preserveChangeId: true });
-      await atomicWriteJson(this.file, draft);
-      this.state = draft;
+      await this.#commitDraft(draft, [event]);
       this.#publish(normalizedChange.collection, event);
       return { applied: true, duplicate: false, event: structuredClone(event) };
     });
@@ -153,16 +249,31 @@ export class SyncioDatabase {
 
   snapshot() { return structuredClone(this.state); }
 
+  async checkpoint() {
+    return this.#enqueue(async () => this.#checkpointNow());
+  }
+
   async replaceState(nextState) {
     return this.#enqueue(async () => {
       const replacement = normalizeState(structuredClone(nextState), this.state._syncio.databaseId);
       await atomicWriteJson(this.file, replacement);
       this.state = replacement;
+      try {
+        await this.wal.reset();
+        this.commitsSinceCheckpoint = 0;
+        this.lastCheckpointError = null;
+      } catch (error) {
+        this.lastCheckpointError = error;
+      }
       return this.snapshot();
     });
   }
 
-  async close() { await this.writeQueue; }
+  async close() {
+    await this.writeQueue;
+    if (this.commitsSinceCheckpoint > 0) await this.#checkpointNow();
+    await this.wal.close();
+  }
 
   async #mutate(collectionName, mutation, eventFactory) {
     return this.#enqueue(async () => {
@@ -171,11 +282,38 @@ export class SyncioDatabase {
       const result = mutation(collection, draft);
       const eventData = eventFactory?.(result) ?? null;
       const event = eventData ? this.#appendChange(draft, { collection: collectionName, ...eventData }) : null;
-      await atomicWriteJson(this.file, draft);
-      this.state = draft;
-      if (event) this.#publish(collectionName, event);
+      if (event) {
+        await this.#commitDraft(draft, [event]);
+        this.#publish(collectionName, event);
+      }
       return result;
     });
+  }
+
+  async #commitDraft(draft, events) {
+    const baseSequence = this.state._syncio.sequence;
+    await this.wal.append({
+      databaseId: this.databaseId,
+      baseSequence,
+      resultSequence: draft._syncio.sequence,
+      events
+    });
+    this.state = draft;
+    this.commitsSinceCheckpoint += 1;
+    if (this.commitsSinceCheckpoint >= this.checkpointEvery) {
+      try { await this.#checkpointNow(); }
+      catch (error) { this.lastCheckpointError = error; }
+    }
+  }
+
+  async #checkpointNow() {
+    if (this.commitsSinceCheckpoint === 0) return { sequence: this.sequence, compacted: 0 };
+    const sequence = this.sequence;
+    await atomicWriteJson(this.file, this.state);
+    const remaining = await this.wal.compactThrough(sequence);
+    this.commitsSinceCheckpoint = remaining;
+    this.lastCheckpointError = null;
+    return { sequence, compacted: true, remainingWalEntries: remaining };
   }
 
   #enqueue(work) {
@@ -204,6 +342,7 @@ export class SyncioDatabase {
   #publish(collection, event) {
     const payload = structuredClone(event);
     for (const listener of this.listeners.get(collection) ?? []) queueMicrotask(() => listener(structuredClone(payload)));
+    for (const listener of this.changeListeners) queueMicrotask(() => listener(structuredClone(payload)));
   }
 }
 
@@ -300,6 +439,57 @@ function normalizeState(input, databaseId) {
   return state;
 }
 
+function replayWal(initialState, entries, retention) {
+  const state = normalizeState(initialState);
+  for (const entry of entries) {
+    if (entry.databaseId !== state._syncio.databaseId) {
+      const error = new Error('Syncio WAL database identity mismatch');
+      error.code = 'SYNCIO_WAL_DATABASE_MISMATCH';
+      throw error;
+    }
+    if (entry.resultSequence <= state._syncio.sequence) continue;
+    if (entry.baseSequence !== state._syncio.sequence) {
+      const error = new Error(`Syncio WAL sequence gap: expected ${state._syncio.sequence}, received ${entry.baseSequence}`);
+      error.code = 'SYNCIO_WAL_SEQUENCE_GAP';
+      throw error;
+    }
+    let expected = entry.baseSequence;
+    for (const event of entry.events) {
+      if (!event || event.sequence !== ++expected) {
+        const error = new Error('Syncio WAL event sequence is invalid');
+        error.code = 'SYNCIO_CORRUPT_WAL';
+        throw error;
+      }
+      applyEventToState(state, event);
+      state._syncio.changes.push(structuredClone(event));
+      state._syncio.appliedChangeIds[event.changeId] = event.sequence;
+    }
+    if (expected !== entry.resultSequence) {
+      const error = new Error('Syncio WAL result sequence does not match event sequence');
+      error.code = 'SYNCIO_CORRUPT_WAL';
+      throw error;
+    }
+    state._syncio.sequence = entry.resultSequence;
+    pruneChangeMetadata(state, retention);
+  }
+  return state;
+}
+
+function applyEventToState(state, event) {
+  validateCollectionName(event.collection);
+  const collection = state.collections[event.collection] ??= {};
+  if (event.type === 'remove') {
+    validateId(event.id);
+    delete collection[event.id];
+    return;
+  }
+  if (event.type !== 'insert' && event.type !== 'upsert') throw new Error(`unsupported WAL event type: ${event.type}`);
+  validateRecord(event.record, 'WAL replay');
+  if (!event.record.id) throw new Error('WAL record requires id');
+  validateId(event.record.id);
+  collection[event.record.id] = structuredClone(event.record);
+}
+
 function pruneChangeMetadata(state, retention) {
   const changes = state._syncio.changes;
   if (changes.length <= retention) return;
@@ -315,12 +505,12 @@ function legacyChangeId(change) {
 
 async function readStateWithRecovery(target) {
   try {
-    return JSON.parse(await fs.readFile(target, 'utf8'));
+    return { state: JSON.parse(await fs.readFile(target, 'utf8')), exists: true };
   } catch (error) {
-    if (error.code === 'ENOENT') return { version: 1, collections: {} };
+    if (error.code === 'ENOENT') return { state: { version: 1, collections: {} }, exists: false };
     if (!(error instanceof SyntaxError)) throw error;
     try {
-      return JSON.parse(await fs.readFile(`${target}.bak`, 'utf8'));
+      return { state: JSON.parse(await fs.readFile(`${target}.bak`, 'utf8')), exists: true };
     } catch (backupError) {
       if (backupError.code === 'ENOENT' || backupError instanceof SyntaxError) {
         const recoveryError = new Error(`Syncio database is corrupted and no valid backup exists: ${target}`);
@@ -336,22 +526,24 @@ async function readStateWithRecovery(target) {
 async function atomicWriteJson(target, value) {
   await fs.mkdir(path.dirname(target), { recursive: true });
   const temp = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  const backupTemp = `${target}.bak.${process.pid}.${crypto.randomUUID()}.tmp`;
   const data = `${JSON.stringify(value, null, 2)}\n`;
   try {
     await fs.writeFile(temp, data, { encoding: 'utf8', mode: 0o600 });
     const tempHandle = await fs.open(temp, 'r');
     try { await tempHandle.sync(); } finally { await tempHandle.close(); }
-    try {
-      await fs.copyFile(target, `${target}.bak`);
-      const backupHandle = await fs.open(`${target}.bak`, 'r');
-      try { await backupHandle.sync(); } finally { await backupHandle.close(); }
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
     await fs.rename(temp, target);
     const directoryHandle = await fs.open(path.dirname(target), 'r');
     try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+
+    await fs.writeFile(backupTemp, data, { encoding: 'utf8', mode: 0o600 });
+    const backupHandle = await fs.open(backupTemp, 'r');
+    try { await backupHandle.sync(); } finally { await backupHandle.close(); }
+    await fs.rename(backupTemp, `${target}.bak`);
+    const backupDirectoryHandle = await fs.open(path.dirname(target), 'r');
+    try { await backupDirectoryHandle.sync(); } finally { await backupDirectoryHandle.close(); }
   } finally {
     await fs.rm(temp, { force: true }).catch(() => undefined);
+    await fs.rm(backupTemp, { force: true }).catch(() => undefined);
   }
 }

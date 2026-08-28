@@ -4,12 +4,58 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  qualify:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-      - run: npm test
+          node-version: ${{ matrix.node-version }}
+      - run: npm install --ignore-scripts --no-package-lock
+      - run: npm run qualify
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t syncio:qualification .
+      - name: Start image
+        run: |
+          docker run -d --name syncio-qualification \
+            -e SYNCIO_AUTH_SECRET=0123456789abcdef0123456789abcdef \
+            -e SYNCIO_PROJECT_ID=qualification \
+            -p 18787:8787 \
+            syncio:qualification
+      - name: Verify health and authenticated durable API
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18787/health >/tmp/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          TOKEN=$(docker run --rm \
+            -e SYNCIO_AUTH_SECRET=0123456789abcdef0123456789abcdef \
+            -e SYNCIO_PROJECT_ID=qualification \
+            syncio:qualification node bin/syncio-server.js token qualifier)
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:18787/collections/qualification)" = "403"
+          test "$(curl --silent --output /tmp/write.json --write-out '%{http_code}' \
+            -X PUT \
+            -H "authorization: Bearer ${TOKEN}" \
+            -H 'content-type: application/json' \
+            --data '{"verified":true}' \
+            http://127.0.0.1:18787/collections/qualification/container)" = "200"
+          grep '"verified":true' /tmp/write.json
+      - name: Stop cleanly
+        if: always()
+        run: docker stop --time 10 syncio-qualification || true
