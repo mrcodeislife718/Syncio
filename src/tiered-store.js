@@ -39,6 +39,7 @@ export class SegmentedDocumentStore {
   get size(){return this.state.recordCount;}
   stats(){return Object.freeze({records:this.state.recordCount,tombstones:this.state.tombstones,segments:this.state.activeSegment,activeSegmentBytes:this.state.activeBytes,indexEntries:this.index.liveEntries+this.index.deletedEntries,index:this.index.stats(),cache:this.cache.stats()});}
   has(id){validateId(id);const entry=this.index.get(id);return Boolean(entry&&!entry.deleted);}
+  version(id){validateId(id);return this.index.get(id)?.sequence??0;}
   ids(){return this.index.ids();}
 
   getSync(id){
@@ -85,15 +86,29 @@ export class SegmentedDocumentStore {
 
   async compact(){
     return this.#enqueue(async()=>{
-      const tempDir=path.join(this.directory,`.compact-${crypto.randomUUID()}`);
+      const parent=path.dirname(this.directory),base=path.basename(this.directory);
+      const tempDir=path.join(parent,`.compact-${base}-${crypto.randomUUID()}`);
+      const oldDir=path.join(parent,`.old-${base}-${crypto.randomUUID()}`);
+      const failedDir=path.join(parent,`.failed-${base}-${crypto.randomUUID()}`);
       const replacement=await SegmentedDocumentStore.open(tempDir,{segmentBytes:this.segmentBytes,cacheBytes:0,fsync:this.fsync,indexCacheBuckets:this.index.maxCachedBuckets});
-      for(const record of this.scanSync())await replacement.put(record);
-      await replacement.close();
-      const oldDir=path.join(path.dirname(this.directory),`.old-${path.basename(this.directory)}-${crypto.randomUUID()}`);
-      await fs.rename(this.directory,oldDir);await fs.rename(tempDir,this.directory);await fsyncDirectory(path.dirname(this.directory));
-      const reopened=await SegmentedDocumentStore.open(this.directory,{segmentBytes:this.segmentBytes,cacheBytes:this.cache.maxBytes,fsync:this.fsync,indexCacheBuckets:this.index.maxCachedBuckets});
-      this.state=reopened.state;this.index=reopened.index;this.cache.clear();await fs.rm(oldDir,{recursive:true,force:true});
-      return this.stats();
+      try{
+        for(const record of this.scanSync())await replacement.put(record);
+        await replacement.close();
+        await fs.rename(this.directory,oldDir);
+        try{
+          await fs.rename(tempDir,this.directory);await fsyncDirectory(parent);
+          const reopened=await SegmentedDocumentStore.open(this.directory,{segmentBytes:this.segmentBytes,cacheBytes:this.cache.maxBytes,fsync:this.fsync,indexCacheBuckets:this.index.maxCachedBuckets});
+          this.state=reopened.state;this.index=reopened.index;this.cache.clear();
+          await fs.rm(oldDir,{recursive:true,force:true});
+          return this.stats();
+        }catch(error){
+          if(await exists(this.directory))await fs.rename(this.directory,failedDir).catch(()=>undefined);
+          if(await exists(oldDir))await fs.rename(oldDir,this.directory).catch(()=>undefined);
+          await fsyncDirectory(parent).catch(()=>undefined);
+          await fs.rm(failedDir,{recursive:true,force:true}).catch(()=>undefined);
+          throw error;
+        }
+      }finally{await fs.rm(tempDir,{recursive:true,force:true}).catch(()=>undefined);}
     });
   }
 
@@ -131,12 +146,23 @@ class BucketedOffsetIndex {
   constructor(directory,{maxCachedBuckets}){this.directory=directory;this.maxCachedBuckets=maxCachedBuckets;this.cache=new Map();this.bucketNames=[];this.bucketCount=0;this.liveEntries=0;this.deletedEntries=0;this.hits=0;this.misses=0;this.evictions=0;}
   async open(){await fs.mkdir(this.directory,{recursive:true});this.bucketNames=(await fs.readdir(this.directory)).filter(name=>/^bucket-[a-f0-9]{4}\.json$/.test(name)).sort();this.bucketCount=this.bucketNames.length;return this;}
   get(id){const bucket=this.load(this.bucketName(id));return bucket.map.get(id)??null;}
-  set(id,entry){validateEntry(entry);const name=this.bucketName(id),bucket=this.load(name);bucket.map.set(id,{...entry});if(!this.bucketNames.includes(name)){this.bucketNames.push(name);this.bucketNames.sort();this.bucketCount=this.bucketNames.length;}return bucket;}
+  set(id,entry){
+    validateEntry(entry);const name=this.bucketName(id),bucket=this.load(name),previous=bucket.map.get(id);
+    if(previous){if(previous.deleted)this.deletedEntries--;else this.liveEntries--;}
+    if(entry.deleted)this.deletedEntries++;else this.liveEntries++;
+    bucket.map.set(id,{...entry});if(!this.bucketNames.includes(name)){this.bucketNames.push(name);this.bucketNames.sort();this.bucketCount=this.bucketNames.length;}return bucket;
+  }
   ids(){const ids=[];for(const[id,entry]of this.entryIterator())if(!entry.deleted)ids.push(id);return ids.sort();}
   *entryIterator(){for(const name of this.bucketNames){const bucket=this.load(name);for(const[id,entry]of bucket.map)yield[id,entry];}}
   *liveEntryIterator(){for(const[id,entry]of this.entryIterator())if(!entry.deleted)yield[id,entry];}
   async persist(buckets,doFsync){for(const bucket of buckets)await atomicWriteJson(path.join(this.directory,bucket.name),{version:1,entries:Object.fromEntries(bucket.map)},doFsync);this.bucketCount=this.bucketNames.length;}
-  load(name){const cached=this.cache.get(name);if(cached){this.hits++;this.cache.delete(name);this.cache.set(name,cached);return cached;}this.misses++;let value={version:1,entries:{}};try{value=JSON.parse(fsSync.readFileSync(path.join(this.directory,name),'utf8'));}catch(error){if(error.code!=='ENOENT')throw corruption(`offset bucket read failed: ${error.message}`);}if(value.version!==1||!value.entries||typeof value.entries!=='object'||Array.isArray(value.entries))throw corruption('invalid offset bucket');const bucket={name,map:new Map(Object.entries(value.entries))};this.cache.set(name,bucket);while(this.cache.size>this.maxCachedBuckets){const oldest=this.cache.keys().next().value;this.cache.delete(oldest);this.evictions++;}return bucket;}
+  load(name){
+    const cached=this.cache.get(name);if(cached){this.hits++;this.cache.delete(name);this.cache.set(name,cached);return cached;}
+    this.misses++;let value={version:1,entries:{}};try{value=JSON.parse(fsSync.readFileSync(path.join(this.directory,name),'utf8'));}catch(error){if(error.code!=='ENOENT')throw corruption(`offset bucket read failed: ${error.message}`);}
+    if(value.version!==1||!value.entries||typeof value.entries!=='object'||Array.isArray(value.entries))throw corruption('invalid offset bucket');
+    for(const[id,entry]of Object.entries(value.entries)){validateId(id);validateEntry(entry);}
+    const bucket={name,map:new Map(Object.entries(value.entries))};this.cache.set(name,bucket);while(this.cache.size>this.maxCachedBuckets){const oldest=this.cache.keys().next().value;this.cache.delete(oldest);this.evictions++;}return bucket;
+  }
   bucketName(id){return`bucket-${crypto.createHash('sha256').update(id).digest('hex').slice(0,4)}.json`;}
   clearCache(){this.cache.clear();}
   stats(){return{format:'bucketed-offset-index/1',buckets:this.bucketCount,cachedBuckets:this.cache.size,maxCachedBuckets:this.maxCachedBuckets,hits:this.hits,misses:this.misses,evictions:this.evictions};}
