@@ -75,13 +75,15 @@ export function createPolicyEngine(rules = []) {
   const normalized = rules.map((rule) => ({ effect: rule.effect ?? 'deny', ...rule }));
   return {
     authorize(context) {
+      let allowed = false;
       for (const rule of normalized) {
-        if (rule.collection && rule.collection !== context.collection) continue;
-        if (rule.action && rule.action !== context.action) continue;
+        if (rule.collection && rule.collection !== '*' && rule.collection !== context.collection) continue;
+        if (rule.action && rule.action !== '*' && rule.action !== context.action) continue;
         if (typeof rule.when === 'function' && !rule.when(context)) continue;
-        return rule.effect === 'allow';
+        if (rule.effect !== 'allow') return false;
+        allowed = true;
       }
-      return false;
+      return allowed;
     }
   };
 }
@@ -99,9 +101,25 @@ export function migrate(state, migrations = []) {
 }
 
 export function createReplicationPacket({ from, cursor = 0, changes = [] }) {
-  return { protocol: 'syncio-replication/1', from, cursor, changes: changes.map(clone), digest: digest({ from, cursor, changes }) };
+  const payload = { from, cursor, changes: changes.map(clone) };
+  return { protocol: 'syncio-replication/1', ...payload, digest: digest(payload) };
 }
-export function verifyReplicationPacket(packet) { return packet?.protocol === 'syncio-replication/1' && packet.digest === digest({ from: packet.from, cursor: packet.cursor, changes: packet.changes }); }
+
+export function verifyReplicationPacket(packet) {
+  if (packet?.protocol !== 'syncio-replication/1' || !Array.isArray(packet.changes)) return false;
+  return packet.digest === digest({ from: packet.from, cursor: packet.cursor, changes: packet.changes });
+}
+
+export function createSnapshotPacket({ from, cursor = 0, state }) {
+  const snapshot = clone(state);
+  const payload = { from, cursor, state: snapshot };
+  return { protocol: 'syncio-snapshot/1', ...payload, digest: digest(payload) };
+}
+
+export function verifySnapshotPacket(packet) {
+  if (packet?.protocol !== 'syncio-snapshot/1' || !packet.state || typeof packet.state !== 'object') return false;
+  return packet.digest === digest({ from: packet.from, cursor: packet.cursor, state: packet.state });
+}
 
 function createDraftApi(draft) {
   return {
