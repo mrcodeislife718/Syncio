@@ -4,6 +4,7 @@ const UPDATE_OPERATORS=new Set(['$set','$unset','$inc','$mul','$min','$max','$pu
 export function createResourcePolicy(rules=[]){
   const normalized=rules.map((rule,index)=>normalizeRule(rule,index));
   return Object.freeze({
+    hasScope(context){return normalized.some((rule)=>rule.effect==='allow'&&matchesScope(rule,context));},
     authorize(context){return decision(normalized,context).allowed;},
     read(context,record){
       if(!record)return null;const result=decision(normalized,{...context,record});if(!result.allowed)return null;
@@ -30,7 +31,7 @@ export function createResourcePolicy(rules=[]){
   });
 }
 
-function decision(rules,context){let allowed=false;const matches=[];for(const rule of rules){if(!matchesScope(rule,context))continue;if(typeof rule.when==='function'&&!rule.when(context))continue;matches.push(rule);if(rule.effect==='deny')return{allowed:false,matches};allowed=true;}return{allowed,matches};}
+function decision(rules,context){let allowed=false;const matches=[];for(const rule of rules){if(!matchesScope(rule,context))continue;if(typeof rule.when==='function'){let matches=false;try{matches=Boolean(rule.when(context));}catch{matches=false;}if(!matches)continue;}matches.push(rule);if(rule.effect==='deny')return{allowed:false,matches};allowed=true;}return{allowed,matches};}
 function matchesScope(rule,context){if(rule.collection&&rule.collection!=='*'&&rule.collection!==context.collection)return false;if(rule.action&&rule.action!=='*'&&rule.action!==context.action)return false;return true;}
 function normalizeRule(rule,index){if(!rule||typeof rule!=='object'||Array.isArray(rule))throw new TypeError(`policy rule ${index} must be object`);const effect=rule.effect??'deny';if(!['allow','deny'].includes(effect))throw new TypeError(`policy rule ${index} has invalid effect`);return{...rule,effect,readFields:normalizeFields(rule.readFields),denyReadFields:normalizeFields(rule.denyReadFields),writeFields:normalizeFields(rule.writeFields)};}
 function normalizeFields(value){if(value===undefined)return null;if(!Array.isArray(value)||value.some((item)=>typeof item!=='string'||!/^[A-Za-z0-9_-]+$/.test(item)))throw new TypeError('policy fields must be top-level field names');return[...new Set(value)];}
