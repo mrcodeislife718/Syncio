@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import crypto from 'node:crypto';
 import { startSelfHostedSyncio } from '../src/self-host.js';
-import { createTokenAuthority } from '../src/operations.js';
+import { RotatingTokenAuthority } from '../src/security.js';
 
 const command = process.argv[2] ?? 'serve';
 const file = process.env.SYNCIO_DATA_FILE ?? './data/syncio.json';
@@ -13,7 +13,7 @@ if (!secret || Buffer.byteLength(secret) < 32) {
   process.exitCode = 64;
 } else if (command === 'token') {
   const subject = process.argv[3] ?? 'operator';
-  const authority = createTokenAuthority(secret, { issuer:`syncio:${projectId}` });
+  const authority = new RotatingTokenAuthority({ keys:{legacy:secret}, activeKeyId:'legacy', issuer:`syncio:${projectId}` });
   process.stdout.write(`${authority.issue({subject,projectId,role:'owner',entitlements:['database','realtime']})}\n`);
 } else if (command === 'serve') {
   const host = process.env.SYNCIO_HOST ?? '0.0.0.0';
