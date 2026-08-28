@@ -46,12 +46,12 @@ export function createSyncioServer({
       }
 
       if (req.method === 'POST' && url.pathname === '/replicate/push') {
-        if (!authorize(policy, { user, action: 'replicate', collection: '*' }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
-        const body = await readJson(req, { maxBodyBytes });
-        if (!verifyReplicationPacket(body)) return respond(res, 400, { error: 'invalid_replication_packet', requestId }, { observe, requestId, req, startedAt });
+        const body = await readJson(req, { maxBodyBytes, requireObject: true });
+        if (!authorize(policy, { user, action: 'replicate', collection: '*', body }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
+        if (!verifyReplicationPacket(body) || !Array.isArray(body.changes)) return respond(res, 400, { error: 'invalid_replication_packet', requestId }, { observe, requestId, req, startedAt });
         let accepted = 0;
         let duplicates = 0;
-        for (const change of body.changes ?? []) {
+        for (const change of body.changes) {
           const result = await applyReplicatedChange(db, change, { conflictStrategy });
           if (result?.duplicate) duplicates++;
           else {
@@ -69,15 +69,13 @@ export function createSyncioServer({
       const collectionName = decodeURIComponent(parts[1]);
       const id = parts[2] ? decodeURIComponent(parts[2]) : null;
       const collection = db.collection(collectionName);
-      const action = req.method === 'GET' ? 'read' : req.method === 'DELETE' ? 'delete' : 'write';
-      if (!authorize(policy, { user, action, collection: collectionName, id }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
 
-      if (req.method === 'GET' && !id) {
-        const query = parseQuery(url);
-        return respond(res, 200, { records: queryRecords(collection.all(), query) }, { observe, requestId, req, startedAt });
-      }
-
-      if (req.method === 'GET' && id) {
+      if (req.method === 'GET') {
+        if (!authorize(policy, { user, action: 'read', collection: collectionName, id }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
+        if (!id) {
+          const query = parseQuery(url);
+          return respond(res, 200, { records: queryRecords(collection.all(), query) }, { observe, requestId, req, startedAt });
+        }
         const record = collection.get(id);
         return record
           ? respond(res, 200, record, { observe, requestId, req, startedAt })
@@ -86,26 +84,24 @@ export function createSyncioServer({
 
       if (req.method === 'POST' && !id) {
         const body = await readJson(req, { maxBodyBytes, requireObject: true });
+        if (!authorize(policy, { user, action: 'write', collection: collectionName, id, body }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const record = await collection.insert(body);
-        const change = db.changesSince(Math.max(0, db.sequence - 1), { limit: 1 })[0];
-        publish(subscriptions, collectionName, change);
+        publishLatest(db, subscriptions, collectionName);
         return respond(res, 201, record, { observe, requestId, req, startedAt });
       }
 
       if (req.method === 'PUT' && id) {
         const body = await readJson(req, { maxBodyBytes, requireObject: true });
+        if (!authorize(policy, { user, action: 'write', collection: collectionName, id, body }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const record = await collection.upsert({ ...body, id });
-        const change = db.changesSince(Math.max(0, db.sequence - 1), { limit: 1 })[0];
-        publish(subscriptions, collectionName, change);
+        publishLatest(db, subscriptions, collectionName);
         return respond(res, 200, record, { observe, requestId, req, startedAt });
       }
 
       if (req.method === 'DELETE' && id) {
+        if (!authorize(policy, { user, action: 'delete', collection: collectionName, id }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const removed = await collection.remove(id);
-        if (removed) {
-          const change = db.changesSince(Math.max(0, db.sequence - 1), { limit: 1 })[0];
-          publish(subscriptions, collectionName, change);
-        }
+        if (removed) publishLatest(db, subscriptions, collectionName);
         return respond(res, removed ? 200 : 404, { removed }, { observe, requestId, req, startedAt });
       }
 
@@ -113,20 +109,9 @@ export function createSyncioServer({
     } catch (error) {
       const status = error.statusCode ?? 500;
       const code = error.code ?? (status === 500 ? 'internal_error' : 'bad_request');
-      safeObserve(observe, {
-        type: 'request_error',
-        requestId,
-        method: req.method,
-        path: req.url,
-        status,
-        code,
-        error: status >= 500 ? error : undefined
-      });
-      if (!res.headersSent) {
-        json(res, status, { error: code, requestId });
-      } else if (!res.writableEnded) {
-        res.end();
-      }
+      safeObserve(observe, { type: 'request_error', requestId, method: req.method, path: req.url, status, code, error: status >= 500 ? error : undefined });
+      if (!res.headersSent) json(res, status, { error: code, requestId });
+      else if (!res.writableEnded) res.end();
     }
   });
 
@@ -137,10 +122,7 @@ export function createSyncioServer({
   return {
     server,
     async listen({ port = 0, host = '127.0.0.1' } = {}) {
-      await new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(port, host, resolve);
-      });
+      await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); });
       const address = server.address();
       return { host, port: address.port, url: `http://${host}:${address.port}` };
     },
@@ -152,10 +134,7 @@ export function createSyncioServer({
       const set = subscriptions.get(collection) ?? new Set();
       set.add(listener);
       subscriptions.set(collection, set);
-      return () => {
-        set.delete(listener);
-        if (!set.size) subscriptions.delete(collection);
-      };
+      return () => { set.delete(listener); if (!set.size) subscriptions.delete(collection); };
     }
   };
 }
@@ -173,11 +152,7 @@ export class ReplicationClient {
 
   async pull(apply) {
     if (typeof apply !== 'function') throw new TypeError('ReplicationClient.pull requires apply callback');
-    const response = await this.fetch(`${this.baseUrl}/replicate/pull`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ cursor: this.cursor })
-    });
+    const response = await this.fetch(`${this.baseUrl}/replicate/pull`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cursor: this.cursor }) });
     if (!response.ok) throw new Error(`replication pull failed: ${response.status}`);
     const packet = await response.json();
     if (!verifyReplicationPacket(packet)) throw new Error('server returned invalid replication packet');
@@ -195,20 +170,14 @@ export class ReplicationClient {
       delete change.attempts;
       change.changeId ??= crypto.randomUUID();
       const packet = createReplicationPacket({ from: this.nodeId, cursor: this.cursor, changes: [change] });
-      const response = await this.fetch(`${this.baseUrl}/replicate/push`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(packet)
-      });
+      const response = await this.fetch(`${this.baseUrl}/replicate/push`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(packet) });
       if (!response.ok) throw new Error(`replication push failed: ${response.status}`);
     });
   }
 }
 
 export async function applyReplicatedChange(db, change, { conflictStrategy = 'last-write-wins' } = {}) {
-  if (typeof db.applyReplicationChange === 'function') {
-    return db.applyReplicationChange(change, (local, remote) => resolveConflict(local, remote, conflictStrategy));
-  }
+  if (typeof db.applyReplicationChange === 'function') return db.applyReplicationChange(change, (local, remote) => resolveConflict(local, remote, conflictStrategy));
   const collection = db.collection(change.collection);
   if (change.type === 'remove') {
     const applied = await collection.remove(change.id);
@@ -228,11 +197,14 @@ function authorize(policy, context, res, requestId) {
   return allowed;
 }
 
+function publishLatest(db, subscriptions, collection) {
+  const change = db.changesSince(Math.max(0, db.sequence - 1), { limit: 1 })[0];
+  publish(subscriptions, collection, change);
+}
+
 function publish(subscriptions, collection, change) {
   if (!change) return;
-  for (const listener of subscriptions.get(collection) ?? []) {
-    queueMicrotask(() => listener(structuredClone(change)));
-  }
+  for (const listener of subscriptions.get(collection) ?? []) queueMicrotask(() => listener(structuredClone(change)));
 }
 
 function parseQuery(url) {
@@ -252,7 +224,6 @@ function parseQuery(url) {
 async function readJson(req, { maxBodyBytes, requireObject = false } = {}) {
   const contentLength = Number(req.headers['content-length']);
   if (Number.isFinite(contentLength) && contentLength > maxBodyBytes) throw clientError(413, 'payload_too_large');
-
   const chunks = [];
   let bytes = 0;
   for await (const chunk of req) {
@@ -264,7 +235,6 @@ async function readJson(req, { maxBodyBytes, requireObject = false } = {}) {
     if (requireObject) throw clientError(400, 'json_object_required');
     return null;
   }
-
   const text = Buffer.concat(chunks).toString('utf8');
   let value;
   try { value = JSON.parse(text); }
@@ -299,14 +269,7 @@ function respond(res, status, body, context) {
 
 function finishObserved(observe, requestId, req, res, startedAt) {
   const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
-  safeObserve(observe, {
-    type: 'request_complete',
-    requestId,
-    method: req.method,
-    path: req.url,
-    status: res.statusCode,
-    durationMs
-  });
+  safeObserve(observe, { type: 'request_complete', requestId, method: req.method, path: req.url, status: res.statusCode, durationMs });
 }
 
 function safeObserve(observe, event) {
