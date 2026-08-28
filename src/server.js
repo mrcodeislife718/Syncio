@@ -1,6 +1,6 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { OfflineQueue, createPolicyEngine, createReplicationPacket, verifyReplicationPacket, resolveConflict, queryRecords } from './advanced.js';
+import { OfflineQueue, createPolicyEngine, createReplicationPacket, verifyReplicationPacket, createSnapshotPacket, verifySnapshotPacket, resolveConflict, queryRecords } from './advanced.js';
 
 const DEFAULT_MAX_BODY_BYTES = 1_048_576;
 const DEFAULT_REPLICATION_LIMIT = 1_000;
@@ -40,9 +40,20 @@ export function createSyncioServer({
         if (!authorize(policy, { user, action: 'replicate', collection: '*' }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const body = await readJson(req, { maxBodyBytes });
         const cursor = normalizeCursor(body?.cursor ?? 0);
+        const retained = db.changesSince(0, { limit: 10_000 });
+        const oldestRetained = retained[0]?.sequence ?? (db.sequence + 1);
+        if (cursor < oldestRetained - 1) {
+          safeObserve(observe, { type: 'replication_cursor_expired', requestId, cursor, oldestRetained, sequence: db.sequence });
+          return respond(res, 409, { error: 'snapshot_required', requestId, cursor, oldestRetained, sequence: db.sequence }, { observe, requestId, req, startedAt });
+        }
         const changes = db.changesSince(cursor, { limit: replicationLimit });
         const nextCursor = changes.at(-1)?.sequence ?? cursor;
         return respond(res, 200, createReplicationPacket({ from: nodeId, cursor: nextCursor, changes }), { observe, requestId, req, startedAt });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/replicate/snapshot') {
+        if (!authorize(policy, { user, action: 'replicate', collection: '*' }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
+        return respond(res, 200, createSnapshotPacket({ from: nodeId, cursor: db.sequence, state: db.snapshot() }), { observe, requestId, req, startedAt });
       }
 
       if (req.method === 'POST' && url.pathname === '/replicate/push') {
@@ -150,15 +161,43 @@ export class ReplicationClient {
     this.cursor = normalizeCursor(cursor);
   }
 
-  async pull(apply) {
+  async pull(apply, { reseed } = {}) {
     if (typeof apply !== 'function') throw new TypeError('ReplicationClient.pull requires apply callback');
-    const response = await this.fetch(`${this.baseUrl}/replicate/pull`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cursor: this.cursor }) });
+    let response = await this.fetch(`${this.baseUrl}/replicate/pull`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cursor: this.cursor }) });
+    if (response.status === 409) {
+      const problem = await response.json().catch(() => ({}));
+      if (problem.error !== 'snapshot_required') throw new Error('replication pull conflict');
+      if (typeof reseed !== 'function') {
+        const error = new Error('replication cursor expired; snapshot reseed required');
+        error.code = 'SYNCIO_SNAPSHOT_REQUIRED';
+        error.details = problem;
+        throw error;
+      }
+      response = await this.fetch(`${this.baseUrl}/replicate/snapshot`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      if (!response.ok) throw new Error(`replication snapshot failed: ${response.status}`);
+      const snapshot = await response.json();
+      if (!verifySnapshotPacket(snapshot)) throw new Error('server returned invalid snapshot packet');
+      await reseed(cloneSnapshotState(snapshot.state));
+      this.cursor = normalizeCursor(snapshot.cursor);
+      return 0;
+    }
     if (!response.ok) throw new Error(`replication pull failed: ${response.status}`);
     const packet = await response.json();
     if (!verifyReplicationPacket(packet)) throw new Error('server returned invalid replication packet');
     for (const change of packet.changes ?? []) await apply(change);
     this.cursor = normalizeCursor(packet.cursor ?? this.cursor);
     return packet.changes?.length ?? 0;
+  }
+
+  async reseedDatabase(db) {
+    if (!db || typeof db.replaceState !== 'function') throw new TypeError('reseedDatabase requires Syncio-compatible database');
+    const response = await this.fetch(`${this.baseUrl}/replicate/snapshot`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    if (!response.ok) throw new Error(`replication snapshot failed: ${response.status}`);
+    const snapshot = await response.json();
+    if (!verifySnapshotPacket(snapshot)) throw new Error('server returned invalid snapshot packet');
+    await db.replaceState(cloneSnapshotState(snapshot.state));
+    this.cursor = normalizeCursor(snapshot.cursor);
+    return this.cursor;
   }
 
   queue(change) { return this.offline.enqueue(change); }
@@ -189,6 +228,11 @@ export async function applyReplicatedChange(db, change, { conflictStrategy = 'la
   const resolved = resolveConflict(current, incoming, conflictStrategy);
   await collection.upsert(resolved);
   return { applied: true, duplicate: false };
+}
+
+function cloneSnapshotState(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) throw new TypeError('snapshot state must be an object');
+  return { version: state.version ?? 1, collections: structuredClone(state.collections ?? {}) };
 }
 
 function authorize(policy, context, res, requestId) {
