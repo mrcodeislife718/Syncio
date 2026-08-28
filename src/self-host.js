@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { ProductionSyncioDatabase } from './production-db.js';
+import { createNetworkDatabase } from './network-db.js';
 import { createSyncioServer } from './server.js';
 import { MetricsRegistry, AuditLog } from './operations.js';
 import { RotatingTokenAuthority } from './security.js';
@@ -9,121 +10,19 @@ import { DurableTelemetryExporter, SloMonitor, createTelemetryObserver } from '.
 import { TokenBucketLimiter, rateLimitError } from './resource-control.js';
 
 export async function startSelfHostedSyncio({
-  file,
-  secret,
-  tokenKeys,
-  activeKeyId,
-  projectId = 'self-hosted',
-  host = '127.0.0.1',
-  port = 8787,
-  auditFile = `${file}.audit.ndjson`,
-  revocationFile = `${file}.revocations.ndjson`,
-  pitrDirectory = `${file}.pitr`,
-  tokenTtlSeconds = 3600,
-  ttlSweepIntervalMs = 60_000,
-  pitrSnapshotIntervalMs = 3_600_000,
-  telemetry,
-  slo,
-  rateLimit = { capacity: 240, refillPerSecond: 4, maxKeys: 10_000 },
-  databaseOptions = {}
-} = {}) {
-  if (!file) throw new TypeError('self-hosted Syncio requires file');
-  if (!projectId || typeof projectId !== 'string') throw new TypeError('self-hosted Syncio requires projectId');
-  if (!Number.isFinite(ttlSweepIntervalMs) || ttlSweepIntervalMs < 0) throw new TypeError('ttlSweepIntervalMs must be non-negative');
-  if (!Number.isFinite(pitrSnapshotIntervalMs) || pitrSnapshotIntervalMs < 0) throw new TypeError('pitrSnapshotIntervalMs must be non-negative');
-
-  const keyring = normalizeKeys({ secret, tokenKeys, activeKeyId });
-  const authority = new RotatingTokenAuthority({ keys:keyring.keys, activeKeyId:keyring.activeKeyId, issuer:`syncio:${projectId}`, ttlSeconds:tokenTtlSeconds });
-  const revocations = await DurableRevocationLedger.open(path.resolve(revocationFile), authority);
-  const limiter = new TokenBucketLimiter(rateLimit);
-  const db = await ProductionSyncioDatabase.open(path.resolve(file), databaseOptions);
-  const metrics = new MetricsRegistry();
-  const audit = new AuditLog(path.resolve(auditFile));
-  const pitr = await PointInTimeRecovery.open(db, path.resolve(pitrDirectory));
-  const sloMonitor = new SloMonitor(slo);
-  const telemetryExporter = telemetry?.endpoint
-    ? await DurableTelemetryExporter.open(path.resolve(telemetry.spoolFile ?? `${file}.telemetry.json`), telemetry)
-    : null;
-  const metricObserver = metrics.observer();
-  const remoteObserver = telemetryExporter ? createTelemetryObserver(telemetryExporter) : null;
-
-  const observe = (event) => {
-    metricObserver(event);
-    if (Number.isFinite(event?.durationMs)) sloMonitor.record({ status:event.status, durationMs:event.durationMs });
-    remoteObserver?.(event);
-    if (event.type === 'request_error' || event.type === 'replication_cursor_expired' || event.type === 'subscription_backpressure') {
-      void audit.append({ type:event.type, requestId:event.requestId, status:event.status, code:event.code, cursor:event.cursor, collection:event.collection }).catch(()=>undefined);
-    }
-  };
-
-  const authenticate = async (req) => {
-    const token = req?.headers?.authorization ?? '';
-    const identity = `${req?.socket?.remoteAddress ?? 'unknown'}:${typeof token === 'string' ? token.slice(-24) : ''}`;
-    const decision = limiter.consume(identity);
-    if (!decision.allowed) throw rateLimitError(decision);
-    const user = authority.authenticateRequest(req);
-    return user?.projectId === projectId ? user : null;
-  };
-
-  const policies = [
-    { effect:'allow', collection:'*', action:'read', when:({user})=>Boolean(user) && has(user,'database') },
-    { effect:'allow', collection:'*', action:'write', when:({user})=>Boolean(user) && has(user,'database') },
-    { effect:'allow', collection:'*', action:'delete', when:({user})=>Boolean(user) && has(user,'database') },
-    { effect:'allow', collection:'*', action:'replicate', when:({user})=>Boolean(user) && (has(user,'realtime') || has(user,'realtime:basic')) }
-  ];
-
-  const service = createSyncioServer({ db, policies, authenticate, observe });
-  const address = await service.listen({ host, port });
-  const timers = [];
-  if (ttlSweepIntervalMs > 0) timers.push(schedule(async()=>db.sweepExpired(), ttlSweepIntervalMs, (error)=>audit.append({type:'ttl_sweep_error',code:error.code??'TTL_SWEEP_FAILED'})));
-  if (pitrSnapshotIntervalMs > 0) timers.push(schedule(async()=>pitr.createSnapshot({reason:'scheduled'}), pitrSnapshotIntervalMs, (error)=>audit.append({type:'pitr_snapshot_error',code:error.code??'PITR_SNAPSHOT_FAILED'})));
-  if (telemetryExporter && telemetry.flushIntervalMs !== 0) timers.push(schedule(async()=>telemetryExporter.flush(), telemetry.flushIntervalMs ?? 10_000, (error)=>audit.append({type:'telemetry_flush_error',code:error.code??'TELEMETRY_FLUSH_FAILED'})));
-
-  let closed = false;
-  return Object.freeze({
-    address,
-    db,
-    metrics,
-    audit,
-    limiter,
-    pitr,
-    slo: sloMonitor,
-    telemetry: telemetryExporter,
-    authority,
-    revocations,
-    issueToken({ subject='operator', role='owner', entitlements=['database','realtime'] } = {}) {
-      return authority.issue({ subject, projectId, role, entitlements });
-    },
-    rotateTokenKey(keyId, key) { return authority.rotate(keyId, key); },
-    retireTokenKey(keyId) { return authority.retire(keyId); },
-    revokeToken(jti, options) { return revocations.revokeToken(jti, options); },
-    revokeSubject(subject, options) { return revocations.revokeSubject(subject, options); },
-    revokeAll(options) { return revocations.revokeAll(options); },
-    async flushTelemetry() { return telemetryExporter ? telemetryExporter.flush() : { delivered:0, pending:0, batches:0 }; },
-    async close() {
-      if (closed) return;
-      closed = true;
-      for (const timer of timers) clearInterval(timer);
-      await service.close();
-      await pitr.close();
-      await revocations.close();
-      if (telemetryExporter) { await telemetryExporter.flush().catch(()=>undefined); await telemetryExporter.close(); }
-      await db.close();
-    }
-  });
+  file, secret, tokenKeys, activeKeyId, projectId='self-hosted', host='127.0.0.1', port=8787,
+  auditFile=`${file}.audit.ndjson`, revocationFile=`${file}.revocations.ndjson`, pitrDirectory=`${file}.pitr`,
+  tokenTtlSeconds=3600, ttlSweepIntervalMs=60_000, pitrSnapshotIntervalMs=3_600_000, telemetry, slo,
+  rateLimit={capacity:240,refillPerSecond:4,maxKeys:10_000}, databaseOptions={}
+}={}) {
+  if(!file)throw new TypeError('self-hosted Syncio requires file');if(!projectId||typeof projectId!=='string')throw new TypeError('self-hosted Syncio requires projectId');if(!Number.isFinite(ttlSweepIntervalMs)||ttlSweepIntervalMs<0)throw new TypeError('ttlSweepIntervalMs must be non-negative');if(!Number.isFinite(pitrSnapshotIntervalMs)||pitrSnapshotIntervalMs<0)throw new TypeError('pitrSnapshotIntervalMs must be non-negative');
+  const keyring=normalizeKeys({secret,tokenKeys,activeKeyId});const authority=new RotatingTokenAuthority({keys:keyring.keys,activeKeyId:keyring.activeKeyId,issuer:`syncio:${projectId}`,ttlSeconds:tokenTtlSeconds});const revocations=await DurableRevocationLedger.open(path.resolve(revocationFile),authority);const limiter=new TokenBucketLimiter(rateLimit);const db=await ProductionSyncioDatabase.open(path.resolve(file),databaseOptions);const networkDb=createNetworkDatabase(db);const metrics=new MetricsRegistry();const audit=new AuditLog(path.resolve(auditFile));const pitr=await PointInTimeRecovery.open(db,path.resolve(pitrDirectory));const sloMonitor=new SloMonitor(slo);const telemetryExporter=telemetry?.endpoint?await DurableTelemetryExporter.open(path.resolve(telemetry.spoolFile??`${file}.telemetry.json`),telemetry):null;const metricObserver=metrics.observer();const remoteObserver=telemetryExporter?createTelemetryObserver(telemetryExporter):null;
+  const observe=(event)=>{metricObserver(event);if(Number.isFinite(event?.durationMs))sloMonitor.record({status:event.status,durationMs:event.durationMs});remoteObserver?.(event);if(event.type==='request_error'||event.type==='replication_cursor_expired'||event.type==='subscription_backpressure')void audit.append({type:event.type,requestId:event.requestId,status:event.status,code:event.code,cursor:event.cursor,collection:event.collection}).catch(()=>undefined);};
+  const authenticate=async(req)=>{const token=req?.headers?.authorization??'';const identity=`${req?.socket?.remoteAddress??'unknown'}:${typeof token==='string'?token.slice(-24):''}`;const decision=limiter.consume(identity);if(!decision.allowed)throw rateLimitError(decision);const user=authority.authenticateRequest(req);return user?.projectId===projectId?user:null;};
+  const policies=[{effect:'allow',collection:'*',action:'read',when:({user})=>Boolean(user)&&has(user,'database')},{effect:'allow',collection:'*',action:'write',when:({user})=>Boolean(user)&&has(user,'database')},{effect:'allow',collection:'*',action:'delete',when:({user})=>Boolean(user)&&has(user,'database')},{effect:'allow',collection:'*',action:'replicate',when:({user})=>Boolean(user)&&(has(user,'realtime')||has(user,'realtime:basic'))}];
+  const service=createSyncioServer({db:networkDb,policies,authenticate,observe});const address=await service.listen({host,port});const timers=[];if(ttlSweepIntervalMs>0)timers.push(schedule(async()=>db.sweepExpired(),ttlSweepIntervalMs,(error)=>audit.append({type:'ttl_sweep_error',code:error.code??'TTL_SWEEP_FAILED'})));if(pitrSnapshotIntervalMs>0)timers.push(schedule(async()=>pitr.createSnapshot({reason:'scheduled'}),pitrSnapshotIntervalMs,(error)=>audit.append({type:'pitr_snapshot_error',code:error.code??'PITR_SNAPSHOT_FAILED'})));if(telemetryExporter&&telemetry.flushIntervalMs!==0)timers.push(schedule(async()=>telemetryExporter.flush(),telemetry.flushIntervalMs??10_000,(error)=>audit.append({type:'telemetry_flush_error',code:error.code??'TELEMETRY_FLUSH_FAILED'})));
+  let closed=false;return Object.freeze({address,db,metrics,audit,limiter,pitr,slo:sloMonitor,telemetry:telemetryExporter,authority,revocations,issueToken({subject='operator',role='owner',entitlements=['database','realtime']}={}){return authority.issue({subject,projectId,role,entitlements});},rotateTokenKey(keyId,key){return authority.rotate(keyId,key);},retireTokenKey(keyId){return authority.retire(keyId);},revokeToken(jti,options){return revocations.revokeToken(jti,options);},revokeSubject(subject,options){return revocations.revokeSubject(subject,options);},revokeAll(options){return revocations.revokeAll(options);},async flushTelemetry(){return telemetryExporter?telemetryExporter.flush():{delivered:0,pending:0,batches:0};},async close(){if(closed)return;closed=true;for(const timer of timers)clearInterval(timer);await service.close();await pitr.close();await revocations.close();if(telemetryExporter){await telemetryExporter.flush().catch(()=>undefined);await telemetryExporter.close();}await db.close();}});
 }
-
-function has(user, entitlement) { const grants=new Set(user?.entitlements??[]); return grants.has('*')||grants.has(entitlement); }
-function normalizeKeys({secret,tokenKeys,activeKeyId}) {
-  if (tokenKeys) {
-    if (!activeKeyId) throw new TypeError('activeKeyId required with tokenKeys');
-    return { keys:tokenKeys, activeKeyId };
-  }
-  if (secret === undefined || secret === null) throw new TypeError('self-hosted Syncio requires secret or tokenKeys');
-  return { keys:{ legacy:secret }, activeKeyId:'legacy' };
-}
-function schedule(work, intervalMs, onError) {
-  const timer=setInterval(()=>{Promise.resolve().then(work).catch((error)=>Promise.resolve(onError?.(error)).catch(()=>undefined));},intervalMs);
-  timer.unref?.();
-  return timer;
-}
+function has(user,entitlement){const grants=new Set(user?.entitlements??[]);return grants.has('*')||grants.has(entitlement);}
+function normalizeKeys({secret,tokenKeys,activeKeyId}){if(tokenKeys){if(!activeKeyId)throw new TypeError('activeKeyId required with tokenKeys');return{keys:tokenKeys,activeKeyId};}if(secret===undefined||secret===null)throw new TypeError('self-hosted Syncio requires secret or tokenKeys');return{keys:{legacy:secret},activeKeyId:'legacy'};}
+function schedule(work,intervalMs,onError){const timer=setInterval(()=>{Promise.resolve().then(work).catch((error)=>Promise.resolve(onError?.(error)).catch(()=>undefined));},intervalMs);timer.unref?.();return timer;}
