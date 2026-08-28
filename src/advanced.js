@@ -1,27 +1,37 @@
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
+import { firstPathValue, matchesDocument, projectDocument } from './document.js';
 
 const clone = (value) => structuredClone(value);
 
 export class QueryIndex {
   constructor(field) { this.field = field; this.map = new Map(); }
   rebuild(records) { this.map.clear(); for (const record of records) this.add(record); return this; }
-  add(record) { const key = stableKey(record[this.field]); const set = this.map.get(key) ?? new Set(); set.add(record.id); this.map.set(key, set); }
-  remove(record) { const key = stableKey(record[this.field]); const set = this.map.get(key); if (!set) return; set.delete(record.id); if (!set.size) this.map.delete(key); }
+  add(record) { const key = stableKey(firstPathValue(record, this.field)); const set = this.map.get(key) ?? new Set(); set.add(record.id); this.map.set(key, set); }
+  remove(record) { const key = stableKey(firstPathValue(record, this.field)); const set = this.map.get(key); if (!set) return; set.delete(record.id); if (!set.size) this.map.delete(key); }
   find(value) { return [...(this.map.get(stableKey(value)) ?? [])]; }
 }
 
 export function queryRecords(records, spec = {}) {
   if (records && typeof records.__syncioQuery === 'function') return records.__syncioQuery(spec);
   let output = [...records];
-  if (spec.where) output = output.filter((record) => matchWhere(record, spec.where));
+  if (spec.where) output = output.filter((record) => matchesDocument(record, spec.where));
   if (spec.orderBy) {
-    const [{ field, direction = 'asc' }] = Array.isArray(spec.orderBy) ? spec.orderBy : [spec.orderBy];
-    output.sort((a, b) => compare(a[field], b[field]) * (direction === 'desc' ? -1 : 1));
+    const order = Array.isArray(spec.orderBy) ? spec.orderBy : [spec.orderBy];
+    for (const item of order) {
+      if (!item || typeof item.field !== 'string' || !item.field.length || !['asc','desc'].includes(item.direction ?? 'asc')) throw new TypeError('invalid orderBy specification');
+    }
+    output.sort((a, b) => {
+      for (const { field, direction = 'asc' } of order) {
+        const result = compare(firstPathValue(a, field), firstPathValue(b, field)) * (direction === 'desc' ? -1 : 1);
+        if (result) return result;
+      }
+      return 0;
+    });
   }
   if (Number.isInteger(spec.offset) && spec.offset > 0) output = output.slice(spec.offset);
   if (Number.isInteger(spec.limit) && spec.limit >= 0) output = output.slice(0, spec.limit);
-  return output.map(clone);
+  return output.map((record) => projectDocument(record, spec.projection));
 }
 
 export class TransactionManager {
@@ -135,7 +145,6 @@ function createDraftApi(draft) {
     }
   };
 }
-function matchWhere(record, where) { return Object.entries(where).every(([field, expected]) => { const actual = record[field]; if (expected && typeof expected === 'object' && !Array.isArray(expected)) { if ('$gt' in expected && !(actual > expected.$gt)) return false; if ('$gte' in expected && !(actual >= expected.$gte)) return false; if ('$lt' in expected && !(actual < expected.$lt)) return false; if ('$lte' in expected && !(actual <= expected.$lte)) return false; if ('$in' in expected && !expected.$in.includes(actual)) return false; return true; } return Object.is(actual, expected); }); }
-function compare(a,b) { if (Object.is(a,b)) return 0; return a > b ? 1 : -1; }
+function compare(a,b) { if (Object.is(a,b)) return 0; if (a === undefined) return -1; if (b === undefined) return 1; return a > b ? 1 : -1; }
 function stableKey(value) { return JSON.stringify(value); }
 function digest(value) { return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex'); }

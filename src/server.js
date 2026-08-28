@@ -1,6 +1,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { OfflineQueue, createPolicyEngine, createReplicationPacket, verifyReplicationPacket, createSnapshotPacket, verifySnapshotPacket, resolveConflict, queryRecords } from './advanced.js';
+import { atomicUpdateDocument, aggregateCollection } from './document-api.js';
 
 const DEFAULT_MAX_BODY_BYTES = 1_048_576;
 const DEFAULT_REPLICATION_LIMIT = 1_000;
@@ -92,8 +93,17 @@ export function createSyncioServer({
       }
 
       const collectionName = decodeURIComponent(parts[1]);
-      const id = parts[2] ? decodeURIComponent(parts[2]) : null;
+      const aggregateRoute = parts[2] === 'aggregate' && !parts[3];
+      const id = aggregateRoute ? null : (parts[2] ? decodeURIComponent(parts[2]) : null);
       const collection = db.collection(collectionName);
+
+      if (req.method === 'POST' && aggregateRoute) {
+        const body = await readJson(req, { maxBodyBytes, requireObject: true });
+        if (!authorize(policy, { user, action: 'read', collection: collectionName, body }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
+        if (!Array.isArray(body.pipeline)) throw clientError(400, 'aggregation_pipeline_required');
+        const records = aggregateCollection(db, collectionName, body.pipeline);
+        return respond(res, 200, { records }, { observe, requestId, req, startedAt });
+      }
 
       if (req.method === 'GET') {
         if (!authorize(policy, { user, action: 'read', collection: collectionName, id }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
@@ -118,6 +128,13 @@ export function createSyncioServer({
         const body = await readJson(req, { maxBodyBytes, requireObject: true });
         if (!authorize(policy, { user, action: 'write', collection: collectionName, id, body }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         const record = await collection.upsert({ ...body, id });
+        return respond(res, 200, record, { observe, requestId, req, startedAt });
+      }
+
+      if (req.method === 'PATCH' && id) {
+        const body = await readJson(req, { maxBodyBytes, requireObject: true });
+        if (!authorize(policy, { user, action: 'write', collection: collectionName, id, body }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
+        const record = await atomicUpdateDocument(db, collectionName, id, body, { upsert: url.searchParams.get('upsert') === 'true' });
         return respond(res, 200, record, { observe, requestId, req, startedAt });
       }
 
@@ -302,17 +319,26 @@ function authorize(policy, context, res, requestId) {
 }
 
 function parseQuery(url) {
-  let where;
-  if (url.searchParams.has('where')) {
-    try { where = JSON.parse(url.searchParams.get('where')); }
-    catch { throw clientError(400, 'invalid_where'); }
-  }
+  const where = parseJsonParam(url, 'where');
+  const projection = parseJsonParam(url, 'projection');
+  const orderBy = parseJsonParam(url, 'orderBy');
   let limit;
+  let offset;
   if (url.searchParams.has('limit')) {
     limit = Number(url.searchParams.get('limit'));
     if (!Number.isSafeInteger(limit) || limit < 0 || limit > 10_000) throw clientError(400, 'invalid_limit');
   }
-  return { where, limit };
+  if (url.searchParams.has('offset')) {
+    offset = Number(url.searchParams.get('offset'));
+    if (!Number.isSafeInteger(offset) || offset < 0) throw clientError(400, 'invalid_offset');
+  }
+  return { where, projection, orderBy, limit, offset };
+}
+
+function parseJsonParam(url, name) {
+  if (!url.searchParams.has(name)) return undefined;
+  try { return JSON.parse(url.searchParams.get(name)); }
+  catch { throw clientError(400, `invalid_${name}`); }
 }
 
 async function readJson(req, { maxBodyBytes, requireObject = false } = {}) {
