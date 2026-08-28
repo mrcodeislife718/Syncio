@@ -14,8 +14,8 @@ A capability is PROVEN only when repository evidence demonstrates its implemente
 | Integrated transactions | PROVEN | Multi-record commit, rollback, restart durability. |
 | Transaction isolation under contention | PROVEN | 100 contended increments plus queued-failure recovery tests. |
 | JSON persistence semantic consistency | PROVEN | Values that change JSON meaning are rejected before commit. |
-| Query engine | PARTIALLY_PROVEN | Filtering/order/limit and indexed equality queries work. HTTP list-query path still requires planner integration. |
-| Persistent indexes | PROVEN | Persistent catalog, reopen, maintenance across writes/removes/transactions, execution-plan tests. |
+| Query engine | PROVEN | Filtering/order/limit work; HTTP equality queries are verified to delegate through the persistent indexed planner when eligible and fall back to scans otherwise. |
+| Persistent indexes | PROVEN | Persistent catalog, reopen, maintenance across writes/removes/transactions, execution-plan and HTTP integration tests. |
 | Realtime local watchers | PROVEN | Durable-write event tests. |
 | Network realtime delivery | PROVEN | Auth-policy-compatible SSE delivery, heartbeat, bounded connection capacity and backpressure disconnect. Resume/replay semantics for SSE clients remain unverified. |
 | Conflict resolution | PARTIALLY_PROVEN | LWW deterministic convergence is proven; causal/CRDT semantics are not. |
@@ -54,7 +54,7 @@ A capability is PROVEN only when repository evidence demonstrates its implemente
 
 ### What is now strong enough to qualify separately
 
-The embedded/local-first core and authenticated self-host container have moved substantially beyond prototype status. The repository now proves restart durability, transactions, replication recovery, durable offline work, SSE realtime, persistent indexes, first-party authentication, entitlement boundaries, encrypted backup/rollback, control-plane account/project lifecycle, rate limiting, and container operation.
+The embedded/local-first core and authenticated self-host container have moved substantially beyond prototype status. The repository now proves restart durability, transactions, replication recovery, durable offline work, SSE realtime, persistent indexes integrated into the HTTP query path, first-party authentication, entitlement boundaries, encrypted backup/rollback, control-plane account/project lifecycle, rate limiting, and container operation.
 
 ### Blocking launch gaps
 
