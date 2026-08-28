@@ -5,11 +5,12 @@
   "type": "module",
   "exports": {
     ".": "./src/index.js",
-    "./operations": "./src/operations.js"
+    "./operations": "./src/operations.js",
+    "./control-plane": "./src/control-plane.js"
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/advanced.js && node --check src/server.js && node --check src/operations.js",
+    "check": "node --check src/index.js && node --check src/advanced.js && node --check src/server.js && node --check src/operations.js && node --check src/control-plane.js",
     "qualify": "npm run check && npm test"
   },
   "engines": {
