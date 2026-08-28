@@ -15,11 +15,13 @@ async function setup(){
   return{root,control,account,project,manager};
 }
 async function cleanup(s){await s.manager.close().catch(()=>undefined);await s.control.close().catch(()=>undefined);await fs.rm(s.root,{recursive:true,force:true});}
+async function waitFor(check,{attempts=60,delayMs=25}={}){for(let i=0;i<attempts;i++){const value=check();if(value)return value;await new Promise((resolve)=>setTimeout(resolve,delayMs));}throw new Error('condition not reached');}
 
-test('managed runtime starts project in isolated child process and accepts project-scoped token',async(t)=>{
+test('managed runtime starts project in isolated child process and meters real project traffic',async(t)=>{
   const s=await setup();t.after(()=>cleanup(s));const state=await s.manager.startProject(s.project.id,{region:'east'});assert.equal(state.status,'running');assert.notEqual(state.pid,process.pid);assert.equal(state.region,'east');
   const token=s.manager.issueDataToken({projectId:s.project.id,subject:s.account.id});const client=new SyncioClient({baseUrl:state.address.url,token});await client.collection('items').upsert('a',{value:1});assert.equal((await client.collection('items').get('a')).value,1);
-  const status=await s.manager.status(s.project.id);assert.equal(status.runtime.sequence,1);assert.equal(status.runtime.projectId,s.project.id);
+  const usage=await waitFor(()=>{const current=s.manager.revenue.usageSummary(s.project.id).billable;return current.writes>=1&&current.reads>=1?current:null;});assert.ok(usage.writes>=1);assert.ok(usage.reads>=1);
+  const status=await s.manager.status(s.project.id);assert.equal(status.runtime.sequence,1);assert.equal(status.runtime.projectId,s.project.id);assert.ok(status.usage.billable.reads>=1);
 });
 
 test('managed runtime enforces project capacity and supports clean restart with durable data',async(t)=>{
