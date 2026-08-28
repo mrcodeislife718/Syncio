@@ -43,10 +43,24 @@ test('billing state is idempotent and changes durable plan entitlements', async 
   assert.ok(state.control.entitlements(project.id).includes('audit'));
 });
 
+test('authentication resolves current entitlements so downgrade revokes stale token capability', async (t) => {
+  const state=await openControl('downgrade'); t.after(async()=>{await state.control.close();await fs.rm(state.root,{recursive:true,force:true});});
+  const account=await state.control.createAccount({email:'downgrade@example.com'});
+  const project=await state.control.createProject({accountId:account.id,name:'Paid',plan:'business'});
+  const token=state.control.issueProjectToken({accountId:account.id,projectId:project.id});
+  const req={headers:{authorization:`Bearer ${token}`}};
+  assert.ok(state.control.authenticateProjectRequest(project.id,req).entitlements.includes('audit'));
+  await state.control.changePlan(project.id,'free');
+  const current=state.control.authenticateProjectRequest(project.id,req);
+  assert.equal(current.plan,'free');
+  assert.equal(current.entitlements.includes('audit'),false);
+});
+
 test('account export precedes privacy deletion and deletion revokes project access', async (t) => {
   const state=await openControl('delete'); t.after(async()=>{await state.control.close();await fs.rm(state.root,{recursive:true,force:true});});
   const account=await state.control.createAccount({email:'delete@example.com',name:'Delete Me'});
   const project=await state.control.createProject({accountId:account.id,name:'Data'});
+  const token=state.control.issueProjectToken({accountId:account.id,projectId:project.id});
   const exported=await state.control.exportAccount(account.id);
   assert.equal(exported.account.email,'delete@example.com');
   assert.equal(exported.projects.length,1);
@@ -54,16 +68,24 @@ test('account export precedes privacy deletion and deletion revokes project acce
   assert.equal(await state.control.deleteAccount(account.id),true);
   assert.equal(state.control.project(project.id),null);
   assert.deepEqual(state.control.entitlements(project.id),[]);
+  assert.equal(state.control.authenticateProjectRequest(project.id,{headers:{authorization:`Bearer ${token}`}}),null);
   const redacted=state.control.db.collection('_accounts').get(account.id);
   assert.equal(redacted.status,'deleted');
   assert.equal(redacted.name,null);
   assert.equal(redacted.email.includes('delete@example.com'),false);
+  const replacement=await state.control.createAccount({email:'delete@example.com'});
+  assert.notEqual(replacement.id,account.id);
 });
 
 test('duplicate active account email and cross-account token issuance are rejected', async (t) => {
   const state=await openControl('security'); t.after(async()=>{await state.control.close();await fs.rm(state.root,{recursive:true,force:true});});
-  const a=await state.control.createAccount({email:'same@example.com'});
-  await assert.rejects(state.control.createAccount({email:'SAME@example.com'}),/account_email_exists/);
+  const results=await Promise.allSettled([
+    state.control.createAccount({email:'same@example.com'}),
+    state.control.createAccount({email:'SAME@example.com'})
+  ]);
+  assert.equal(results.filter(r=>r.status==='fulfilled').length,1);
+  assert.equal(results.filter(r=>r.status==='rejected').length,1);
+  const a=results.find(r=>r.status==='fulfilled').value;
   const b=await state.control.createAccount({email:'other@example.com'});
   const project=await state.control.createProject({accountId:a.id,name:'A'});
   assert.throws(()=>state.control.issueProjectToken({accountId:b.id,projectId:project.id}),/project_not_found/);
