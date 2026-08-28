@@ -17,11 +17,15 @@ A capability is PROVEN only when repository evidence demonstrates its implemente
 | Integrated transactions | PROVEN | Multi-record WAL commit, rollback, restart durability, and ordered realtime event publication. |
 | Transaction isolation under contention | PROVEN | 100 contended increments plus queued-failure recovery tests. |
 | JSON persistence semantic consistency | PROVEN | Values that change JSON meaning are rejected before commit. |
-| Query engine | PROVEN | Filtering/order/limit work; HTTP equality queries delegate through persistent index planning when eligible. |
-| Persistent indexes | PROVEN | Persistent catalog, reopen, maintenance across writes/removes/transactions, execution-plan and HTTP integration tests. |
+| Nested document query engine | PROVEN | Dotted paths, logical/range/array operators, multi-field sort, pagination and projection are exercised against persisted state and HTTP. |
+| Atomic document updates | PROVEN | Replacement and `$set/$unset/$inc/$mul/$min/$max/$push/$addToSet/$pull/$rename` execute through transactions, WAL and realtime. |
+| Aggregation engine | PROVEN | Match/project/sort/skip/limit/count/unwind/group and core accumulators run against persisted collections and HTTP. |
+| Persistent single-field/nested indexes | PROVEN | Persistent catalog, reopen, mutation maintenance and HTTP planner integration. |
+| Compound indexes | PROVEN | Multi-field equality plans, persistence and query execution are tested. |
+| Unique and sparse-unique indexes | PROVEN | Normal, transaction, replication and simultaneous-write tests prove conflicting values cannot both commit. |
 | Realtime local watchers | PROVEN | Events are emitted only after successful durable commit. |
 | Resumable network change streams | PROVEN | SSE supports durable sequence IDs, `after` and `Last-Event-ID` replay, live continuation, explicit expired-cursor rejection, bounded connections and backpressure disconnect. |
-| Single committed-change publication path | PROVEN | Embedded, HTTP, replication and transaction mutations publish from database commit; duplicate server-side publication was removed. |
+| Single committed-change publication path | PROVEN | Embedded, HTTP, replication and transaction mutations publish from database commit. |
 | Conflict resolution | PARTIALLY_PROVEN | LWW deterministic convergence is proven; richer causal/CRDT semantics remain a future capability decision. |
 | Restart-persistent offline queue | PROVEN | Queue/retry state survives reopen and uses idempotent replication change IDs. |
 | First-party token authentication | PROVEN | HMAC token issue/verify, expiry, canonical encoding, tamper rejection, project/account scoping. Key rotation/revocation remains. |
@@ -45,7 +49,7 @@ A capability is PROVEN only when repository evidence demonstrates its implemente
 | Performance harness | PROVEN | Reproducible hardware/runtime/workload/throughput/memory benchmark command exists. |
 | Performance qualification | UNVERIFIED | Competitive 1x/10x/100x thresholds and identical-workload MongoDB/Redis-style baselines have not yet been accepted and run. |
 | Storage scaling architecture | PARTIALLY_PROVEN | Whole-file rewrite per normal commit is removed. Whole-state draft cloning remains a 10x/100x memory ceiling; paged/segmented state and incremental write sets remain. |
-| Rich MongoDB-class document capability | PARTIALLY_PROVEN | Flexible JSON documents, basic filters/order/limits, indexes and transactions work. Nested operators/projection, compound/unique indexes, atomic update operators, aggregation, schemas, TTL, geo, text, sharding and drivers remain. |
+| MongoDB-class document capability | PARTIALLY_PROVEN | Nested querying/projection, atomic updates, aggregation, compound/unique indexes and transactions are now proven. Schema modes, TTL, text/search, geo, PITR, sharding and mature drivers remain. |
 | TLS / edge termination | UNVERIFIED | Runtime expects trusted TLS termination; deployment-specific certificate lifecycle is not proven. |
 | Key rotation / secret lifecycle | UNVERIFIED | Strong secrets and token expiry exist; rotation/revocation/KMS integration are absent. |
 | Remote tracing / alerting / SLO response | UNVERIFIED | Local metrics/audit exist only. |
@@ -57,7 +61,7 @@ A capability is PROVEN only when repository evidence demonstrates its implemente
 
 **NOT READY** for public managed-cloud production.
 
-The core is materially closer to the intended product: lightweight WAL-first document storage and resumable realtime now share one durable change spine. The next technical capability tranche should expand document/query/index semantics without fragmenting that architecture.
+The database core now combines WAL-first durability, resumable realtime, rich nested documents, partial atomic updates, aggregation, and persistent compound/unique indexing. This is materially closer to the intended MongoDB-capability / Redis-lightness product, but technological superiority is not claimed until direct comparative benchmarks and the remaining scale architecture are proven.
 
 ## Blocking managed-launch gaps
 
@@ -65,7 +69,8 @@ The core is materially closer to the intended product: lightweight WAL-first doc
 2. **BLOCKER — live monetization:** checkout/payment-provider adapter, failed-payment/cancellation/refund/account-management flows and real provider verification are absent.
 3. **CRITICAL — large-dataset memory architecture:** normal disk writes no longer rewrite the whole database, but mutations/transactions still clone substantial logical state; paged/segmented storage and incremental write sets are required for the intended 10x/100x ceiling.
 4. **CRITICAL — repository governance:** `main` remains unprotected and cannot enforce required checks.
-5. **HIGH — secret lifecycle:** no KMS-backed rotation/revocation.
-6. **HIGH — production observability:** no remote metrics/traces, alerting, SLOs or incident-response verification.
-7. **HIGH — TLS/edge deployment:** no production edge/certificate lifecycle proof.
-8. **HIGH — competitive performance evidence:** architecture is improved, but superiority remains unclaimed until reproducible comparative benchmarks pass.
+5. **HIGH — schema/TTL/search/geo/PITR/sharding capability:** these remain necessary before calling Syncio broadly MongoDB-class.
+6. **HIGH — secret lifecycle:** no KMS-backed rotation/revocation.
+7. **HIGH — production observability:** no remote metrics/traces, alerting, SLOs or incident-response verification.
+8. **HIGH — TLS/edge deployment:** no production edge/certificate lifecycle proof.
+9. **HIGH — competitive performance evidence:** architecture is improved, but superiority remains unclaimed until reproducible comparative benchmarks pass.
