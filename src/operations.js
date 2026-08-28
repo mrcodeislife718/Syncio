@@ -94,9 +94,11 @@ export function createTokenAuthority(secret, { issuer = 'syncio', ttlSeconds = 3
       const expected = crypto.createHmac('sha256', key).update(body).digest();
       let supplied;
       try { supplied = Buffer.from(sig, 'base64url'); } catch { return null; }
+      if (supplied.toString('base64url') !== sig) return null;
       if (supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) return null;
       let payload;
       try { payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')); } catch { return null; }
+      if (Buffer.from(body, 'base64url').toString('base64url') !== body) return null;
       const now = Math.floor(Date.now() / 1000);
       if (payload.iss !== issuer || !payload.sub || !payload.projectId || !Number.isSafeInteger(payload.exp) || payload.exp <= now) return null;
       return clone(payload);
