@@ -4,7 +4,7 @@ const UPDATE_OPERATORS=new Set(['$set','$unset','$inc','$mul','$min','$max','$pu
 export function createResourcePolicy(rules=[]){
   const normalized=rules.map((rule,index)=>normalizeRule(rule,index));
   return Object.freeze({
-    hasScope(context){return normalized.some((rule)=>rule.effect==='allow'&&matchesScope(rule,context));},
+    hasScope(context){return decision(normalized,context).allowed;},
     authorize(context){return decision(normalized,context).allowed;},
     read(context,record){
       if(!record)return null;const result=decision(normalized,{...context,record});if(!result.allowed)return null;
