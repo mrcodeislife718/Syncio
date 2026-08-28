@@ -40,6 +40,21 @@ test('unique index rejects duplicate before persistence and leaves durable state
   assert.equal(state.db.collection('users').get('b'),null);
 });
 
+test('concurrent writes cannot race through a unique index',async(t)=>{
+  const state=await setup();t.after(()=>cleanup(state));
+  await state.db.defineIndex('users','email',{unique:true});
+  const results=await Promise.allSettled([
+    state.db.collection('users').upsert({id:'a',email:'race@example.com'}),
+    state.db.collection('users').upsert({id:'b',email:'race@example.com'})
+  ]);
+  assert.equal(results.filter((result)=>result.status==='fulfilled').length,1);
+  assert.equal(results.filter((result)=>result.status==='rejected'&&result.reason?.code==='SYNCIO_UNIQUE_INDEX_VIOLATION').length,1);
+  assert.equal(state.db.collection('users').all().length,1);
+  await state.db.close();
+  state.db=await IndexedSyncioDatabase.open(state.file);
+  assert.equal(state.db.collection('users').all().length,1);
+});
+
 test('compound unique index permits same value in different compound partition',async(t)=>{
   const state=await setup();t.after(()=>cleanup(state));
   await state.db.defineIndex('users',['tenantId','email'],{name:'tenant_email_unique',unique:true});
