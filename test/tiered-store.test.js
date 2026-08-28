@@ -10,14 +10,14 @@ async function root(){return fs.mkdtemp(path.join(os.tmpdir(),'syncio-tiered-'))
 test('segmented store persists records while bounding hot-record cache bytes',async(t)=>{
   const dir=await root();t.after(()=>fs.rm(dir,{recursive:true,force:true}));
   let store=await SegmentedDocumentStore.open(dir,{segmentBytes:64*1024,cacheBytes:2048});
-  for(let i=0;i<100;i++)await store.put({id:`id-${i}`,payload:'x'.repeat(512),n:i});
-  assert.equal(store.size,100);
+  for(let i=0;i<160;i++)await store.put({id:`id-${i}`,payload:'x'.repeat(768),n:i});
+  assert.equal(store.size,160);
   assert.ok(store.stats().segments>1);
   assert.ok(store.stats().cache.bytes<=2048);
   await store.close();
   store=await SegmentedDocumentStore.open(dir,{segmentBytes:64*1024,cacheBytes:2048});
   assert.equal((await store.get('id-73')).n,73);
-  assert.equal(store.size,100);
+  assert.equal(store.size,160);
   assert.ok(store.stats().cache.bytes<=2048);
   await store.close();
 });
