@@ -43,12 +43,14 @@ export class IndexedSyncioDatabase {
     const current = this.definitions[collection] ?? [];
     const collision = current.find((item) => item.name === definition.name);
     if (collision && !sameDefinition(collision, definition)) throw indexError('SYNCIO_INDEX_NAME_CONFLICT', `index '${definition.name}' already exists with different definition`);
-    const next = collision ? current : [...current, definition];
+    if (collision) return publicDefinition(collection, collision);
     const candidate = new DocumentIndex(definition).rebuild(this.base.collection(collection).all());
-    this.definitions = { ...this.definitions, [collection]: next };
+    const previousDefinitions = this.definitions;
+    this.definitions = { ...this.definitions, [collection]: [...current, definition] };
     this.indexes.set(indexKey(collection, definition.name), candidate);
-    await this.#persistCatalog();
-    return structuredClone({ collection, ...definition });
+    try { await this.#persistCatalog(); }
+    catch (error) { this.definitions = previousDefinitions; this.#rebuildCollection(collection); throw error; }
+    return publicDefinition(collection, definition);
   }
 
   async dropIndex(collection, nameOrFields) {
@@ -58,16 +60,18 @@ export class IndexedSyncioDatabase {
     const current = this.definitions[collection] ?? [];
     const nextDefinitions = current.filter((item) => item.name !== name && !(item.fields.length === 1 && item.fields[0] === name));
     if (nextDefinitions.length === current.length) return false;
+    const previousDefinitions = this.definitions;
     const next = { ...this.definitions };
     if (nextDefinitions.length) next[collection] = nextDefinitions; else delete next[collection];
     this.definitions = next;
     this.#rebuildCollection(collection);
-    await this.#persistCatalog();
+    try { await this.#persistCatalog(); }
+    catch (error) { this.definitions = previousDefinitions; this.#rebuildCollection(collection); throw error; }
     return true;
   }
 
   listIndexes() {
-    return Object.entries(this.definitions).flatMap(([collection, definitions]) => definitions.map((definition) => ({ collection, ...structuredClone(definition) })));
+    return Object.entries(this.definitions).flatMap(([collection, definitions]) => definitions.map((definition) => publicDefinition(collection, definition)));
   }
 
   collection(name) {
@@ -75,17 +79,32 @@ export class IndexedSyncioDatabase {
     const db = this;
     return Object.freeze({
       async insert(value) {
-        const candidate = { ...value, id: value?.id };
-        db.#assertUniqueCandidate(name, candidate, null, { allowGeneratedId: true });
-        const result = await baseCollection.insert(value);
-        db.#updateIndexes(name, null, result);
-        return result;
+        if (!db.#hasUniqueIndex(name)) {
+          const result = await baseCollection.insert(value);
+          db.#updateIndexes(name, null, result);
+          return result;
+        }
+        const record = structuredClone({ ...value, id: value?.id ?? crypto.randomUUID() });
+        await db.transaction(async (tx) => {
+          const collection = tx.collection(name);
+          if (collection.get(record.id)) throw indexError('SYNCIO_DUPLICATE_ID', `record '${record.id}' already exists`);
+          collection.put(record);
+        });
+        return structuredClone(record);
       },
       async upsert(value) {
-        const before = value?.id ? baseCollection.get(value.id) : null;
-        db.#assertUniqueCandidate(name, value, value?.id ?? null);
-        const result = await baseCollection.upsert(value);
-        db.#updateIndexes(name, before, result);
+        if (!db.#hasUniqueIndex(name)) {
+          const before = value?.id ? baseCollection.get(value.id) : null;
+          const result = await baseCollection.upsert(value);
+          db.#updateIndexes(name, before, result);
+          return result;
+        }
+        let result;
+        await db.transaction(async (tx) => {
+          const collection = tx.collection(name);
+          collection.put(value);
+          result = structuredClone(value);
+        });
         return result;
       },
       get: (id) => baseCollection.get(id),
@@ -109,8 +128,11 @@ export class IndexedSyncioDatabase {
   query(collection, spec = {}) {
     const plan = this.explainQuery(collection, spec);
     if (plan.strategy === 'index') {
-      const index = this.indexes.get(indexKey(collection, plan.index));
-      const records = index.find(plan.values).map((id) => this.base.collection(collection).get(id)).filter(Boolean);
+      const indexName = plan.index ?? plan.field;
+      const values = plan.values ?? [plan.value];
+      const index = this.indexes.get(indexKey(collection, indexName));
+      if (!index) return queryRecords(this.base.collection(collection).all(), spec);
+      const records = index.find(values).map((id) => this.base.collection(collection).get(id)).filter(Boolean);
       return queryRecords(records, spec);
     }
     return queryRecords(this.base.collection(collection).all(), spec);
@@ -123,13 +145,19 @@ export class IndexedSyncioDatabase {
       .sort((a, b) => b.fields.length - a.fields.length);
     const best = candidates[0];
     if (!best) return { strategy: 'scan' };
+    if (best.fields.length === 1) {
+      const field = best.fields[0];
+      return { strategy: 'index', field, value: where[field] };
+    }
     return { strategy: 'index', index: best.name, fields: [...best.fields], values: best.fields.map((field) => where[field]) };
   }
 
   async transaction(work) {
     if (typeof work !== 'function') throw new TypeError('transaction requires a function');
-    const working = structuredClone(this.base.snapshot().collections ?? {});
-    const result = await this.base.transaction(async (tx) => work(this.#transactionProxy(tx, working)));
+    const result = await this.base.transaction(async (tx) => {
+      const working = structuredClone(this.base.snapshot().collections ?? {});
+      return work(this.#transactionProxy(tx, working));
+    });
     this.#rebuildAll();
     return result;
   }
@@ -142,7 +170,7 @@ export class IndexedSyncioDatabase {
   async applyReplicationChange(change, resolver) {
     const wrappedResolver = (local, remote) => {
       const resolved = resolver(local, remote);
-      this.#assertUniqueCandidate(change.collection, resolved, resolved?.id ?? null);
+      this.#assertUniqueCandidateAgainstRecords(change.collection, resolved, resolved?.id ?? null, this.base.collection(change.collection).all());
       return resolved;
     };
     const result = await this.base.applyReplicationChange(change, wrappedResolver);
@@ -160,7 +188,8 @@ export class IndexedSyncioDatabase {
         return Object.freeze({
           get(id) { return working[name][id] ? structuredClone(working[name][id]) : null; },
           put(record) {
-            db.#assertUniqueCandidateAgainstRecords(name, record, record?.id ?? null, Object.values(working[name]));
+            if (!record?.id) throw new TypeError('transaction put requires id');
+            db.#assertUniqueCandidateAgainstRecords(name, record, record.id, Object.values(working[name]));
             delegate.put(record);
             working[name][record.id] = structuredClone(record);
           },
@@ -176,13 +205,10 @@ export class IndexedSyncioDatabase {
     });
   }
 
-  #assertUniqueCandidate(collection, candidate, excludeId, { allowGeneratedId = false } = {}) {
-    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return;
-    if (!allowGeneratedId && !candidate.id) return;
-    this.#assertUniqueCandidateAgainstRecords(collection, candidate, excludeId, this.base.collection(collection).all());
-  }
+  #hasUniqueIndex(collection) { return (this.definitions[collection] ?? []).some((definition) => definition.unique); }
 
   #assertUniqueCandidateAgainstRecords(collection, candidate, excludeId, records) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return;
     for (const definition of this.definitions[collection] ?? []) {
       if (!definition.unique) continue;
       const values = definition.fields.map((field) => firstPathValue(candidate, field));
@@ -240,6 +266,13 @@ class DocumentIndex {
     if (!set.size) this.map.delete(key);
   }
   find(values) { return [...(this.map.get(stableKey(values)) ?? [])]; }
+}
+
+function publicDefinition(collection, definition) {
+  if (definition.fields.length === 1 && !definition.unique && !definition.sparse && definition.name === definition.fields[0]) {
+    return { collection, field: definition.fields[0] };
+  }
+  return { collection, name: definition.name, fields: [...definition.fields], unique: definition.unique, sparse: definition.sparse };
 }
 
 function normalizeDefinitions(definitions) {
