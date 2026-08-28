@@ -8,6 +8,7 @@ const DEFAULT_CHANGE_RETENTION = 10_000;
 
 export class SyncioDatabase {
   constructor(file, state, { changeRetention = DEFAULT_CHANGE_RETENTION } = {}) {
+    if (!Number.isSafeInteger(changeRetention) || changeRetention < 1) throw new TypeError('changeRetention must be a positive safe integer');
     this.file = file;
     this.state = normalizeState(state);
     this.listeners = new Map();
@@ -94,22 +95,23 @@ export class SyncioDatabase {
 
   async applyReplicationChange(change, resolver) {
     if (!change || typeof change !== 'object') throw new TypeError('replication change must be an object');
-    validateCollectionName(change.collection);
-    if (!change.changeId || typeof change.changeId !== 'string') throw new TypeError('replication change requires changeId');
+    const normalizedChange = structuredClone(change);
+    normalizedChange.changeId ??= legacyChangeId(normalizedChange);
+    validateCollectionName(normalizedChange.collection);
     if (typeof resolver !== 'function') throw new TypeError('replication resolver must be a function');
 
     let outcome;
     await this.#enqueue(async () => {
-      if (this.state._syncio.appliedChangeIds[change.changeId]) {
+      if (this.state._syncio.appliedChangeIds[normalizedChange.changeId]) {
         outcome = { applied: false, duplicate: true };
         return;
       }
 
-      const collection = this.state.collections[change.collection] ??= {};
-      if (change.type === 'remove') {
-        delete collection[change.id];
+      const collection = this.state.collections[normalizedChange.collection] ??= {};
+      if (normalizedChange.type === 'remove') {
+        delete collection[normalizedChange.id];
       } else {
-        const incoming = change.record;
+        const incoming = normalizedChange.record;
         if (!incoming?.id) throw new Error('replicated record requires id');
         const current = collection[incoming.id] ?? null;
         const resolved = resolver(structuredClone(current), structuredClone(incoming));
@@ -118,15 +120,13 @@ export class SyncioDatabase {
       }
 
       const event = this.#appendChange({
-        ...structuredClone(change),
+        ...normalizedChange,
         source: 'replication',
         receivedAt: new Date().toISOString()
       }, { preserveChangeId: true });
-      this.state._syncio.appliedChangeIds[change.changeId] = event.sequence;
-      this.#pruneChangeMetadata();
       await this.#persist();
       outcome = { applied: true, duplicate: false, event: structuredClone(event) };
-      this.#publish(change.collection, event);
+      this.#publish(normalizedChange.collection, event);
     });
     return outcome;
   }
@@ -161,16 +161,18 @@ export class SyncioDatabase {
   }
 
   #appendChange(change, { preserveChangeId = false } = {}) {
-    const sequence = ++this.state._syncio.sequence;
+    const localSequence = ++this.state._syncio.sequence;
+    const copied = structuredClone(change);
     const event = {
-      changeId: preserveChangeId ? change.changeId : crypto.randomUUID(),
-      originDatabaseId: change.originDatabaseId ?? this.state._syncio.databaseId,
-      sequence,
-      at: change.at ?? new Date().toISOString(),
-      ...structuredClone(change)
+      ...copied,
+      changeId: preserveChangeId ? copied.changeId : crypto.randomUUID(),
+      originDatabaseId: copied.originDatabaseId ?? this.state._syncio.databaseId,
+      ...(preserveChangeId && Number.isSafeInteger(copied.sequence) ? { sourceSequence: copied.sequence } : {}),
+      sequence: localSequence,
+      at: copied.at ?? new Date().toISOString()
     };
     this.state._syncio.changes.push(event);
-    this.state._syncio.appliedChangeIds[event.changeId] = sequence;
+    this.state._syncio.appliedChangeIds[event.changeId] = localSequence;
     this.#pruneChangeMetadata();
     return event;
   }
@@ -193,9 +195,7 @@ export class SyncioDatabase {
     }
   }
 
-  async #persist() {
-    await atomicWriteJson(this.file, this.state);
-  }
+  async #persist() { await atomicWriteJson(this.file, this.state); }
 }
 
 export async function open(file, options) { return SyncioDatabase.open(file, options); }
@@ -227,6 +227,10 @@ function normalizeState(input, databaseId) {
   return state;
 }
 
+function legacyChangeId(change) {
+  return `legacy:${crypto.createHash('sha256').update(JSON.stringify(change)).digest('hex')}`;
+}
+
 async function readStateWithRecovery(target) {
   try {
     return JSON.parse(await fs.readFile(target, 'utf8'));
@@ -234,8 +238,7 @@ async function readStateWithRecovery(target) {
     if (error.code === 'ENOENT') return { version: 1, collections: {} };
     if (!(error instanceof SyntaxError)) throw error;
     try {
-      const backup = JSON.parse(await fs.readFile(`${target}.bak`, 'utf8'));
-      return backup;
+      return JSON.parse(await fs.readFile(`${target}.bak`, 'utf8'));
     } catch (backupError) {
       if (backupError.code === 'ENOENT' || backupError instanceof SyntaxError) {
         const recoveryError = new Error(`Syncio database is corrupted and no valid backup exists: ${target}`);
