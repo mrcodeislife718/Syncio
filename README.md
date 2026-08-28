@@ -29,36 +29,50 @@ client write
   -> periodic checkpoint and compaction
 ```
 
-The same committed change is the source of truth for local watchers, network realtime, replication, reconnect replay, and offline synchronization. Syncio does not maintain an independent notification history that can drift away from the database.
+The same committed change is the source of truth for local watchers, network realtime, replication, reconnect replay, and offline synchronization.
+
+## Document capability
+
+Syncio now supports flexible nested JSON documents and arrays, dotted-path queries, logical and comparison operators, projections, multi-field sorting, pagination, nested persistent indexes, compound indexes, unique and sparse-unique indexes, partial atomic document updates, multi-document transactions, and aggregation.
+
+Examples of supported query/update concepts include:
+
+```text
+customer.address.city = "Bronx"
+total >= 25
+$and / $or / $nor
+$in / $nin / $exists / $all / $elemMatch
+$set / $unset / $inc / $mul / $min / $max
+$push / $addToSet / $pull / $rename
+```
+
+Aggregation currently includes match, project, sort, skip, limit, count, unwind and group, with sum/average/min/max/first/last/push/set accumulators.
+
+These capabilities work through the embedded API and the HTTP server. HTTP supports nested query parameters, `PATCH` for atomic document updates, and `POST /collections/:collection/aggregate` for aggregation pipelines.
+
+Unique indexes are enforced before commit, including inside transactions, replicated writes, and simultaneous competing writes.
 
 ## Verified storage behavior
 
 Normal mutations are persisted to an append-only write-ahead log instead of rewriting the complete database file for every record change. The log is fsynced before the mutation becomes committed in memory. Periodic checkpoints consolidate current state and compact old log entries.
 
-Verified recovery behavior includes:
-
-- replaying committed log entries after process-style restart;
-- ignoring an incomplete final log entry caused by an interrupted append;
-- rejecting corruption in a complete log entry;
-- ignoring stale log entries already represented by a durable checkpoint;
-- retaining a latest-checkpoint backup that can recover a corrupted primary checkpoint;
-- preserving ordered durable change history for replication and realtime resume.
+Verified recovery behavior includes replay after restart, interrupted-final-write handling, corruption detection, stale-log handling after checkpoint, and latest-checkpoint backup recovery.
 
 ## Realtime
 
-Collection streams are resumable by durable sequence number.
+Collection streams are resumable by durable sequence number:
 
 ```text
 GET /subscribe/orders?after=88201
 ```
 
-Every delivered change includes its sequence as the Server-Sent Events `id`. Clients can reconnect using `after=<sequence>` or the standard `Last-Event-ID` header. Syncio replays retained missed changes first and then continues delivering live commits.
+Every delivered change includes its sequence as the Server-Sent Events `id`. Clients can reconnect using `after=<sequence>` or `Last-Event-ID`. Syncio replays retained missed changes first and then continues delivering live commits.
 
-If a requested cursor has fallen outside retained history, Syncio returns an explicit `409 stream_resume_expired` instead of silently skipping changes. Applications can refresh/reseed state and resume from a new current cursor.
+If a requested cursor has fallen outside retained history, Syncio returns an explicit conflict instead of silently skipping changes.
 
 ## Requirements
 
-Node.js 20 or newer.
+Node.js 20 or newer. The production runtime currently has no third-party package dependencies.
 
 ## Install from source
 
@@ -67,37 +81,39 @@ npm install
 npm run qualify
 ```
 
-The runtime currently has no third-party production dependencies.
-
-## Embedded usage
+## Embedded example
 
 ```js
-import { open } from './src/index.js';
+import { IndexedSyncioDatabase } from './src/indexed.js';
+import { atomicUpdateDocument } from './src/document-api.js';
 
-const db = await open('./data/app.syncio.json');
-const users = db.collection('users');
-
-await users.insert({ id: 'u1', name: 'Ada' });
-console.log(users.get('u1'));
-
-const stop = db.watchChanges({ collection: 'users', after: db.sequence }, (change) => {
-  console.log(change.sequence, change.type, change.record);
+const db = await IndexedSyncioDatabase.open('./data/app.syncio.json');
+await db.defineIndex('users', ['tenantId', 'email'], {
+  name: 'tenant_email',
+  unique: true
 });
 
-await db.transaction(async (tx) => {
-  tx.collection('accounts').put({ id: 'a', balance: 90 });
-  tx.collection('accounts').put({ id: 'b', balance: 10 });
+await db.collection('users').insert({
+  id: 'u1',
+  tenantId: 't1',
+  email: 'ada@example.com',
+  profile: { address: { city: 'Bronx' } },
+  score: 10
 });
 
-stop();
+await atomicUpdateDocument(db, 'users', 'u1', {
+  $inc: { score: 5 },
+  $set: { 'profile.level': 'gold' }
+});
+
+const users = db.collection('users').query({
+  where: { 'profile.address.city': 'Bronx', score: { $gte: 15 } },
+  projection: { email: 1, score: 1 }
+});
+
+console.log(users);
 await db.close();
 ```
-
-## Self-hosted service
-
-The production-oriented self-host runtime provides authentication, entitlement checks, rate limiting, metrics, durable audit events, indexed queries, replication, resumable realtime, graceful shutdown, and non-root container packaging.
-
-See the CLI entrypoint `syncio-server` and `docs/PRODUCTION_QUALIFICATION.md` for the exact verified deployment path.
 
 ## Architecture and qualification
 
@@ -107,8 +123,6 @@ See the CLI entrypoint `syncio-server` and `docs/PRODUCTION_QUALIFICATION.md` fo
 
 Passing CI means the tested guarantees passed on that exact commit. It does not turn untested managed-cloud or commercial capabilities into proven claims.
 
-## Product capability direction
+## Remaining capability direction
 
-Syncio's document-database roadmap includes rich nested queries and projections, secondary/compound/unique indexes, atomic document updates, aggregation, optional and enforced schemas, multi-document transactions, replication, partitioning, point-in-time recovery, TTL, geospatial and text/search indexes, client drivers, and managed clusters.
-
-Those capabilities are promoted to complete only when they are implemented, integrated, secured where applicable, documented, and independently verified.
+The next MongoDB-class capability gaps include schema validation modes, TTL, broader aggregation/query operators, text/search and geospatial indexes, point-in-time recovery, partitioning/sharding, mature client drivers, and managed clusters. Large-dataset work also needs paged/segmented state so the database does not require its complete logical state to remain hot in memory.
