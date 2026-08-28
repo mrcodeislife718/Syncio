@@ -27,6 +27,9 @@ export class IndexedSyncioDatabase {
 
   get databaseId(){return this.base.databaseId;}
   get sequence(){return this.base.sequence;}
+  storageStatus(){return this.base.storageStatus();}
+  resumeStatus(cursor){return this.base.resumeStatus(cursor);}
+  watchChanges(options,listener){return this.base.watchChanges(options,listener);}
 
   async defineIndex(collection, field) {
     validateName(collection,'collection'); validateName(field,'field');
@@ -92,6 +95,7 @@ export class IndexedSyncioDatabase {
   changesSince(...args){return this.base.changesSince(...args);}
   hasAppliedChange(...args){return this.base.hasAppliedChange(...args);}
   snapshot(){return this.base.snapshot();}
+  async checkpoint(){return this.base.checkpoint();}
   async replaceState(state){const result=await this.base.replaceState(state);this.#rebuildAll();return result;}
   async applyReplicationChange(change,resolver){const result=await this.base.applyReplicationChange(change,resolver);if(result?.applied)this.#rebuildCollection(change.collection);return result;}
   async close(){await this.catalogQueue;await this.base.close();}
