@@ -3,12 +3,11 @@ const UPDATE_OPERATORS=new Set(['$set','$unset','$inc','$mul','$min','$max','$pu
 
 export function createResourcePolicy(rules=[]){
   const normalized=rules.map((rule,index)=>normalizeRule(rule,index));
-  const disabled=normalized.length===0;
   return Object.freeze({
-    hasScope(context){return disabled||normalized.some((rule)=>rule.effect==='allow'&&matchesScope(rule,context));},
-    authorize(context){return disabled||decision(normalized,context).allowed;},
+    hasScope(context){return normalized.some((rule)=>rule.effect==='allow'&&matchesScope(rule,context));},
+    authorize(context){return decision(normalized,context).allowed;},
     read(context,record){
-      if(!record)return null;if(disabled)return clone(record);const result=decision(normalized,{...context,record});if(!result.allowed)return null;
+      if(!record)return null;const result=decision(normalized,{...context,record});if(!result.allowed)return null;
       const fieldRules=result.matches.filter((rule)=>rule.effect==='allow'&&rule.readFields);
       const denied=new Set(result.matches.flatMap((rule)=>rule.denyReadFields??[]));
       if(!fieldRules.length&&!denied.size)return clone(record);
@@ -23,7 +22,7 @@ export function createResourcePolicy(rules=[]){
       return output;
     },
     write(context,body){
-      if(disabled)return{allowed:true};const result=decision(normalized,{...context,body});if(!result.allowed)return{allowed:false,code:'forbidden'};
+      const result=decision(normalized,{...context,body});if(!result.allowed)return{allowed:false,code:'forbidden'};
       const allowRules=result.matches.filter((rule)=>rule.effect==='allow'&&rule.writeFields);if(!allowRules.length)return{allowed:true};
       const allowed=new Set(allowRules.flatMap((rule)=>rule.writeFields));
       for(const field of mutationFields(body))if(field!=='id'&&!allowed.has(field))return{allowed:false,code:'field_forbidden',field};
