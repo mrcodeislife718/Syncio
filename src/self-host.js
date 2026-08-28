@@ -3,6 +3,7 @@ import { ProductionSyncioDatabase } from './production-db.js';
 import { createSyncioServer } from './server.js';
 import { MetricsRegistry, AuditLog } from './operations.js';
 import { RotatingTokenAuthority } from './security.js';
+import { DurableRevocationLedger } from './revocation.js';
 import { PointInTimeRecovery } from './pitr.js';
 import { DurableTelemetryExporter, SloMonitor, createTelemetryObserver } from './telemetry.js';
 import { TokenBucketLimiter, rateLimitError } from './resource-control.js';
@@ -16,6 +17,7 @@ export async function startSelfHostedSyncio({
   host = '127.0.0.1',
   port = 8787,
   auditFile = `${file}.audit.ndjson`,
+  revocationFile = `${file}.revocations.ndjson`,
   pitrDirectory = `${file}.pitr`,
   tokenTtlSeconds = 3600,
   ttlSweepIntervalMs = 60_000,
@@ -32,6 +34,7 @@ export async function startSelfHostedSyncio({
 
   const keyring = normalizeKeys({ secret, tokenKeys, activeKeyId });
   const authority = new RotatingTokenAuthority({ keys:keyring.keys, activeKeyId:keyring.activeKeyId, issuer:`syncio:${projectId}`, ttlSeconds:tokenTtlSeconds });
+  const revocations = await DurableRevocationLedger.open(path.resolve(revocationFile), authority);
   const limiter = new TokenBucketLimiter(rateLimit);
   const db = await ProductionSyncioDatabase.open(path.resolve(file), databaseOptions);
   const metrics = new MetricsRegistry();
@@ -42,7 +45,7 @@ export async function startSelfHostedSyncio({
     ? await DurableTelemetryExporter.open(path.resolve(telemetry.spoolFile ?? `${file}.telemetry.json`), telemetry)
     : null;
   const metricObserver = metrics.observer();
-  const remoteObserver = telemetryExporter ? createTelemetryObserver(telemetryExporter, sloMonitor) : null;
+  const remoteObserver = telemetryExporter ? createTelemetryObserver(telemetryExporter) : null;
 
   const observe = (event) => {
     metricObserver(event);
@@ -87,11 +90,15 @@ export async function startSelfHostedSyncio({
     slo: sloMonitor,
     telemetry: telemetryExporter,
     authority,
+    revocations,
     issueToken({ subject='operator', role='owner', entitlements=['database','realtime'] } = {}) {
       return authority.issue({ subject, projectId, role, entitlements });
     },
     rotateTokenKey(keyId, key) { return authority.rotate(keyId, key); },
     retireTokenKey(keyId) { return authority.retire(keyId); },
+    revokeToken(jti, options) { return revocations.revokeToken(jti, options); },
+    revokeSubject(subject, options) { return revocations.revokeSubject(subject, options); },
+    revokeAll(options) { return revocations.revokeAll(options); },
     async flushTelemetry() { return telemetryExporter ? telemetryExporter.flush() : { delivered:0, pending:0, batches:0 }; },
     async close() {
       if (closed) return;
@@ -99,6 +106,7 @@ export async function startSelfHostedSyncio({
       for (const timer of timers) clearInterval(timer);
       await service.close();
       await pitr.close();
+      await revocations.close();
       if (telemetryExporter) { await telemetryExporter.flush().catch(()=>undefined); await telemetryExporter.close(); }
       await db.close();
     }
