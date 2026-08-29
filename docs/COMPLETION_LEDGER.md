@@ -1,76 +1,83 @@
 # Syncio Production Completion Ledger
 
-Status vocabulary: PROVEN, PARTIALLY_PROVEN, UNVERIFIED, FAILED.
+Status vocabulary: **PROVEN**, **PARTIALLY_PROVEN**, **UNVERIFIED**, **FAILED**.
 
-A capability is PROVEN only when repository evidence demonstrates its implemented path. PROVEN does not imply the entire product is launch-ready.
+A capability is PROVEN only when repository evidence exercises the implemented production path. This ledger separates **technical implementation completeness** from external launch/commercial evidence.
 
-| Capability | Status | Evidence / remaining gate |
+## Technical product capability
+
+| Capability | Status | Evidence / boundary |
 | --- | --- | --- |
-| Durable embedded records | PROVEN | Restart and concurrent-writer tests. |
-| WAL-first normal commits | PROVEN | Normal mutation is fsynced to append-only WAL before in-memory commit; crash-style reopen replays it. |
-| Checkpoint / WAL compaction | PROVEN | Periodic atomic checkpoint and safe WAL compaction tests, including stale-WAL-after-checkpoint recovery. |
-| Latest-checkpoint corruption recovery | PROVEN | Successful checkpoint writes latest-state backup mirror; corrupt primary recovery requires all checkpointed records. |
-| WAL corruption handling | PROVEN | Truncated final append is ignored; corrupt complete WAL entry is rejected. |
-| Durable change feed | PROVEN | The same ordered committed events survive restart and drive realtime/replication history. |
-| Replication push idempotency | PROVEN | Stable change IDs and duplicate replay tests. |
-| Replication cursor retention safety | PROVEN | Expired cursor requires verified snapshot/reseed before incremental replication resumes. |
-| Integrated transactions | PROVEN | Multi-record WAL commit, rollback, restart durability, and ordered realtime event publication. |
-| Transaction isolation under contention | PROVEN | 100 contended increments plus queued-failure recovery tests. |
-| JSON persistence semantic consistency | PROVEN | Values that change JSON meaning are rejected before commit. |
-| Nested document query engine | PROVEN | Dotted paths, logical/range/array operators, multi-field sort, pagination and projection are exercised against persisted state and HTTP. |
-| Atomic document updates | PROVEN | Replacement and `$set/$unset/$inc/$mul/$min/$max/$push/$addToSet/$pull/$rename` execute through transactions, WAL and realtime. |
-| Aggregation engine | PROVEN | Match/project/sort/skip/limit/count/unwind/group and core accumulators run against persisted collections and HTTP. |
-| Persistent single-field/nested indexes | PROVEN | Persistent catalog, reopen, mutation maintenance and HTTP planner integration. |
-| Compound indexes | PROVEN | Multi-field equality plans, persistence and query execution are tested. |
-| Unique and sparse-unique indexes | PROVEN | Normal, transaction, replication and simultaneous-write tests prove conflicting values cannot both commit. |
-| Realtime local watchers | PROVEN | Events are emitted only after successful durable commit. |
-| Resumable network change streams | PROVEN | SSE supports durable sequence IDs, `after` and `Last-Event-ID` replay, live continuation, explicit expired-cursor rejection, bounded connections and backpressure disconnect. |
-| Single committed-change publication path | PROVEN | Embedded, HTTP, replication and transaction mutations publish from database commit. |
-| Conflict resolution | PARTIALLY_PROVEN | LWW deterministic convergence is proven; richer causal/CRDT semantics remain a future capability decision. |
-| Restart-persistent offline queue | PROVEN | Queue/retry state survives reopen and uses idempotent replication change IDs. |
-| First-party token authentication | PROVEN | HMAC token issue/verify, expiry, canonical encoding, tamper rejection, project/account scoping. Key rotation/revocation remains. |
-| Authorization | PARTIALLY_PROVEN | Default deny, deny override, body policies, project and entitlement boundaries are tested. Per-record read/field policy tooling remains. |
-| Request boundary security | PROVEN | Request IDs, body limits, malformed input handling, error redaction and HTTP timeouts. |
-| Rate limiting | PROVEN | Bounded token bucket, deterministic refill and self-host enforcement. Distributed/shared limiter remains unverified. |
-| Admission control primitive | PROVEN | Concurrent admission primitive is tested; managed multi-node integration remains. |
-| Observability | PARTIALLY_PROVEN | Request/error metrics, health storage status and durable audit events exist. Remote metrics/traces, alerting and SLOs remain. |
-| Encrypted backup / restore | PROVEN | AES-256-GCM backup, integrity/authentication, tamper rejection and restore tests. Scheduled remote backup service remains. |
-| Migration orchestration / rollback | PROVEN | Pre-migration encrypted backup, migration history, failed-migration safety and rollback tests. |
-| Account lifecycle / privacy export / deletion | PROVEN | Durable signup state, export, redaction/deletion and token revocation tests. Legal retention policy remains external. |
-| Project lifecycle and tenant authority | PROVEN | Project creation, ownership isolation, scoped token issuance and durable entitlement state. |
-| Billing state / entitlements | PARTIALLY_PROVEN | Atomic idempotent subscription state and verified provider-neutral webhook ingestion. Live checkout/provider/refund/payment-failure flows remain. |
-| Hosted control plane | PARTIALLY_PROVEN | Separate HTTP control API and `syncio-control` process. HA/multi-instance deployment remains. |
-| Hosted data plane | PARTIALLY_PROVEN | Authenticated indexed self-host runtime and container are verified. Managed routing/isolation/regional placement remain. |
-| Self-host deployment | PROVEN | Non-root image is built, booted, health-checked, authorization-tested and cleanly stopped in CI. |
-| Deployment rollback | UNVERIFIED | No published immutable release artifact + previous-version application rollback exercise yet. |
-| CI qualification | PROVEN | Node 20/22 qualification, closure audit, full tests, proof gate and container qualification. |
-| Repository closure audit | PROVEN | CI rejects TODO/FIXME/placeholders/not-implemented markers and skipped tests in production/test code. |
-| Main branch protection | FAILED | GitHub reports `main` protection disabled; available connector does not expose a protection write operation. |
-| Performance harness | PROVEN | Reproducible hardware/runtime/workload/throughput/memory benchmark command exists. |
-| Performance qualification | UNVERIFIED | Competitive 1x/10x/100x thresholds and identical-workload MongoDB/Redis-style baselines have not yet been accepted and run. |
-| Storage scaling architecture | PARTIALLY_PROVEN | Whole-file rewrite per normal commit is removed. Whole-state draft cloning remains a 10x/100x memory ceiling; paged/segmented state and incremental write sets remain. |
-| MongoDB-class document capability | PARTIALLY_PROVEN | Nested querying/projection, atomic updates, aggregation, compound/unique indexes and transactions are now proven. Schema modes, TTL, text/search, geo, PITR, sharding and mature drivers remain. |
-| TLS / edge termination | UNVERIFIED | Runtime expects trusted TLS termination; deployment-specific certificate lifecycle is not proven. |
-| Key rotation / secret lifecycle | UNVERIFIED | Strong secrets and token expiry exist; rotation/revocation/KMS integration are absent. |
-| Remote tracing / alerting / SLO response | UNVERIFIED | Local metrics/audit exist only. |
-| Live payment provider / checkout | UNVERIFIED | No production/sandbox payment provider contract has been exercised. |
-| Customer-facing documentation/support | PARTIALLY_PROVEN | README/architecture/qualification docs exist; full API/operations/support material remains. |
-| Commercialization | UNVERIFIED | Technical billing state exists, but discover → signup → checkout → paid entitlement → retention has not been exercised with real customers. |
+| Storage-backed production engine | PROVEN | Segmented SSD state is authoritative; normal production writes use write-set/OCC transactions rather than whole-database drafts. |
+| Bounded primary metadata | PROVEN | Offset metadata is persistent/bucketed; record-count growth test proves checkpoints do not create per-record OCC tables. |
+| WAL + Commit Fabric | PROVEN | Commit identity/checksum is attached to real durable mutations and verified during recovery. |
+| WAL/checkpoint recovery | PROVEN | Crash replay, truncated-tail tolerance, completed-record corruption rejection, stale WAL handling, backup checkpoint recovery, and recovery manifests. |
+| Durable transaction semantics | PROVEN | Multi-record commits, rollback, OCC retry, contention, restart durability, and failure recovery. |
+| Database ownership | PROVEN | Live second-owner rejection, heartbeat lease, abandoned dead-process recovery, release on close. |
+| Nested document/query engine | PROVEN | Dotted paths, logical/range/array operators, projection, sorting, pagination, aggregation, atomic update operators. |
+| Schema + TTL | PROVEN | Enforced/optional schema persistence, rejection before commit, durable TTL removal through normal commit path. |
+| Ordinary persistent indexes | PROVEN | Single/nested/compound/unique/sparse indexes, persistent bucket storage, bounded cache, reopen/catch-up, typed canonical keys. |
+| Persistent text indexes | PROVEN | Bucketed postings, bounded cache, incremental updates, restart persistence, ranked search. |
+| Persistent geo indexes | PROVEN | Persistent bounded geo cells, radius/nearest queries, incremental maintenance and reopen. |
+| Index failure safety | PROVEN | Corrupt secondary/text index tests prove production falls back to authoritative SSD scans rather than stale results; repair restores indexed operation. |
+| Realtime local/network streams | PROVEN | Post-durable publication, SSE resume, `Last-Event-ID`, replay/live continuation, cursor expiry, capacity and backpressure handling. |
+| Reactive query plane | PROVEN | Real commit consumption, dependency filtering, incremental insert/update/delete for safe shapes, ordered recompute fallback when incremental maintenance is unsafe. |
+| Selective Sync Views | PROVEN | Persisted bounded views, materialization, entry/exit deltas, cursor semantics. |
+| Offline transaction intents | PROVEN | Fsynced restart-persistent intents, integrity, preconditions, conflicts, retries, expiry/cancel states, real transaction reconciliation. |
+| Replication idempotency/reseed | PROVEN | Stable change IDs, duplicate rejection, cursor expiry, verified snapshot reseed, conflict convergence. |
+| Policy plane | PROVEN | Deny by default, deny override, request-body policies, declarative row constraints, safe query pushdown, wildcard/narrow-deny protection, independent compiled/reference verification. |
+| Query/Commit/Sync protocols | PROVEN | Versioned canonical digests, tamper rejection, compatibility negotiation; HTTP query planning uses integrity-checked Query IR and server exposes protocol capabilities. |
+| Hierarchical resource scheduler | PROVEN | Parent/child CPU/RAM/SSD/network/egress/coordination budgets, priorities, realtime/replication admission, TTL/PITR background scheduling, cost-aware transfer selection. |
+| Single-node bounded-memory architecture | PROVEN | Documents, primary offsets, ordinary indexes, text postings and geo cells use persistent bounded-cache paths; streaming scans are exercised. |
+| Deterministic sharding | PROVEN | Consistent hashing, targeted shard-key queries, scatter fallback, verified online moves and rebalancing. |
+| Quorum partition groups | PROVEN | Overlapping read/write quorums, read repair, minority repair, failed-quorum minority rollback, session monotonicity. |
+| Durable cross-shard transactions | PROVEN | Fsynced participants/coordinator, prepare reservations, routed-write exclusion, commit decision recovery after coordinator restart. |
+| Regional failover | PROVEN | Health routing, primary failover, quorum-backed regional writes, append-only global commit metadata. |
+| Global commit metadata | PROVEN | Tamper-evident append-only journal + bounded manifest; history is not resident in RAM. |
+| Dedicated subscription router | PROVEN | Real partition change streams, bounded subscription capacity, scheduler accounting and release. |
+| Authentication/token authority | PROVEN | Signed tokens, project scoping, canonical encoding, expiry, key rotation, token/subject/global revocation and durable tamper-checked revocation ledger. |
+| Request security | PROVEN | Body limits, malformed input rejection, request IDs, error redaction, rate limiting, deny-by-default authorization. |
+| TLS edge | PROVEN at software layer | HTTPS termination/proxy and live certificate-context reload tests pass. Public certificate/DNS operations remain external. |
+| Backup/restore/PITR | PROVEN at software layer | Encrypted backup, tamper detection, restore, migration rollback, PITR snapshots/journal/restart reconciliation. Remote object-store operation remains external. |
+| Observability/SLO plumbing | PROVEN at software layer | Metrics, durable audit, telemetry spool/retry/bounds, SLO calculations and health/storage status. Real alert destination/runbook response remains external. |
+| Managed runtime/control plane | PROVEN at software layer | Project isolation, capacity limits, region validation, durable restart, usage reporting, control API. Public multi-region infrastructure deployment remains external. |
+| Billing/entitlements/commercial state | PROVEN at software layer | Plans, durable usage, quota decisions, invoice calculations, checkout/portal/cancel provider boundary, signed webhook authority, payment failure/recovery, refunds. Live provider account remains external. |
+| Deployment/rollback primitives | PROVEN at software layer | Immutable release identity, candidate health gating, failed-candidate containment and rollback tests. Public artifact promotion remains external. |
+| Self-host production container | PROVEN | Non-root image build/start/health/authenticated durable API/clean shutdown gate. |
+| Closure audit | PROVEN | CI rejects TODO/FIXME/placeholders/not-implemented markers and skipped tests in `src`, `test`, and `bin`. |
+| CI qualification | PROVEN | Exact technical-superiority head passes Node 20, Node 22, proof, closure audit, all tests, and production container. |
+| Direct competitive benchmark superiority | UNVERIFIED | Benchmark harness exists; identical-hardware MongoDB/Redis/Firestore-style comparative evidence has not yet been run and accepted. |
+| Main branch protection | FAILED | GitHub reports `main` unprotected; current connector does not expose a branch-protection write action. |
 
-## Current release authority
+## Qualification evidence at technical-superiority closure
 
-**NOT READY** for public managed-cloud production.
+Exact qualification head before documentation-only closure: `7fb6c912e2315b27d81e2f31735304d5a486b9e8`.
 
-The database core now combines WAL-first durability, resumable realtime, rich nested documents, partial atomic updates, aggregation, and persistent compound/unique indexing. This is materially closer to the intended MongoDB-capability / Redis-lightness product, but technological superiority is not claimed until direct comparative benchmarks and the remaining scale architecture are proven.
+- Node 20: PASS
+- Node 22: PASS
+- tests: **169 passed / 0 failed / 0 skipped / 0 todo**
+- closure audit: PASS
+- proof gate: PASS
+- production container: PASS
 
-## Blocking managed-launch gaps
+The suite includes adversarial failure injection for failed quorum rollback, prepared distributed reservations, coordinator recovery after a durable commit decision, corrupt secondary index fallback/repair, corrupt text-index fallback, wildcard-policy deny precedence, WAL/checkpoint corruption, replication expiry/reseed, token tampering/revocation, and deployment failure containment.
 
-1. **BLOCKER — managed hosted data plane:** tenant routing, process/resource isolation, lifecycle orchestration and regional placement are not implemented or load-tested.
-2. **BLOCKER — live monetization:** checkout/payment-provider adapter, failed-payment/cancellation/refund/account-management flows and real provider verification are absent.
-3. **CRITICAL — large-dataset memory architecture:** normal disk writes no longer rewrite the whole database, but mutations/transactions still clone substantial logical state; paged/segmented storage and incremental write sets are required for the intended 10x/100x ceiling.
-4. **CRITICAL — repository governance:** `main` remains unprotected and cannot enforce required checks.
-5. **HIGH — schema/TTL/search/geo/PITR/sharding capability:** these remain necessary before calling Syncio broadly MongoDB-class.
-6. **HIGH — secret lifecycle:** no KMS-backed rotation/revocation.
-7. **HIGH — production observability:** no remote metrics/traces, alerting, SLOs or incident-response verification.
-8. **HIGH — TLS/edge deployment:** no production edge/certificate lifecycle proof.
-9. **HIGH — competitive performance evidence:** architecture is improved, but superiority remains unclaimed until reproducible comparative benchmarks pass.
+## Technical completion decision
+
+**TECHNICAL-SUPERIORITY IMPLEMENTATION: PROVEN for the tested repository scope.**
+
+This means the architecture that was previously listed as unfinished is now implemented and integrated: storage-backed write sets, Commit Fabric, reactive queries, selective sync, compiled policy planning, hierarchical scheduling, bounded persistent indexes, versioned protocols, quorum replication, durable cross-partition transactions, regional failover, global commit metadata, and failure-safe authoritative index fallback.
+
+It does **not** mean Syncio has empirically proven that it outperforms MongoDB, Redis, or Firestore. That specific comparative claim remains blocked on direct accepted benchmark evidence.
+
+## External launch gates, not missing repository implementations
+
+The remaining blockers are operational/evidence gates rather than the architectural implementation tranche requested here:
+
+1. **Repository governance:** protect `main` and require qualification checks when a branch-protection write path is available.
+2. **Public infrastructure:** deploy the managed control/data planes to real regions, DNS/TLS, storage, telemetry and backup destinations and run failover exercises there.
+3. **Live payment operations:** connect a real/sandbox payment provider account and exercise checkout → verified entitlement → failed payment → recovery/cancel/refund end to end.
+4. **Competitive evidence:** run identical-workload 1×/10×/100× comparisons against accepted MongoDB/Redis/realtime baselines on declared hardware.
+5. **Customer evidence:** exercise onboarding, support, export/deletion and retention with real users before claiming commercial-market completion.
+
+Those gates must not be mislabeled as unimplemented database architecture.
