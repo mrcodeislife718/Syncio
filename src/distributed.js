@@ -1,0 +1,75 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import crypto from 'node:crypto';
+
+const clone=(v)=>structuredClone(v);
+
+export class ReplicatedPartitionGroup {
+  constructor(replicas,{writeQuorum=null,readQuorum=null}={}){
+    if(!replicas||typeof replicas!=='object'||Array.isArray(replicas))throw new TypeError('replicas object required');
+    const entries=Object.entries(replicas);if(entries.length<1)throw new TypeError('at least one replica required');
+    for(const[id,db]of entries)if(!id||!db||typeof db.collection!=='function')throw new TypeError(`invalid replica ${id}`);
+    this.replicas=new Map(entries);this.n=entries.length;this.writeQuorum=quorum(writeQuorum,this.n);this.readQuorum=quorum(readQuorum,this.n);if(this.writeQuorum+this.readQuorum<=this.n)throw new TypeError('read and write quorum must overlap');this.serial=Promise.resolve();this.session=new Map();this.metrics={writes:0,reads:0,repairs:0,failedReplicas:0};
+  }
+  get replicaIds(){return[...this.replicas.keys()].sort();}
+  async put(collection,record,{consistency='quorum',sessionId=null}={}){if(!record?.id)throw new TypeError('record id required');return this.#serializeIf(consistency==='serializable',()=>this.#write(collection,{type:'put',record:clone(record)},sessionId));}
+  async remove(collection,id,{consistency='quorum',sessionId=null}={}){if(typeof id!=='string'||!id)throw new TypeError('id required');return this.#serializeIf(consistency==='serializable',()=>this.#write(collection,{type:'remove',id},sessionId));}
+  async get(collection,id,{consistency='quorum',sessionId=null,maxStalenessMs=5000}={}){
+    const required=consistency==='local'||consistency==='eventual'?1:this.readQuorum;const observations=[];
+    for(const replicaId of this.replicaIds){try{const db=this.replicas.get(replicaId);const record=db.collection(collection).get(id);observations.push({replicaId,record,sequence:db.sequence??0,at:Date.now()});if(observations.length>=required&&consistency!=='serializable')break;}catch{this.metrics.failedReplicas++;}}
+    if(observations.length<required)throw unavailable('read quorum unavailable');
+    let chosen=observations.sort((a,b)=>b.sequence-a.sequence||a.replicaId.localeCompare(b.replicaId))[0];
+    if(consistency==='bounded_staleness'&&Date.now()-chosen.at>maxStalenessMs)throw unavailable('staleness bound exceeded');
+    const minimum=sessionId?this.session.get(sessionId)??0:0;if(['read_your_writes','causal','quorum','serializable'].includes(consistency)&&chosen.sequence<minimum){const all=await this.#readAll(collection,id);chosen=all.sort((a,b)=>b.sequence-a.sequence)[0];if(!chosen||chosen.sequence<minimum)throw unavailable('session consistency unavailable');}
+    this.metrics.reads++;if(sessionId)this.session.set(sessionId,Math.max(minimum,chosen.sequence));void this.#repair(collection,id,chosen).catch(()=>undefined);return clone(chosen.record);
+  }
+  async #write(collection,mutation,sessionId){const operationId=crypto.randomUUID();const results=await Promise.all(this.replicaIds.map(async replicaId=>{const db=this.replicas.get(replicaId);try{if(mutation.type==='put')await db.collection(collection).upsert(mutation.record);else await db.collection(collection).remove(mutation.id);return{replicaId,ok:true,sequence:db.sequence??0};}catch(error){return{replicaId,ok:false,error};}}));const successes=results.filter(r=>r.ok);if(successes.length<this.writeQuorum){this.metrics.failedReplicas+=results.length-successes.length;throw quorumError('write quorum unavailable',{operationId,successes:successes.map(x=>x.replicaId)});}const sequence=Math.max(...successes.map(r=>r.sequence));if(sessionId)this.session.set(sessionId,Math.max(this.session.get(sessionId)??0,sequence));this.metrics.writes++;this.metrics.failedReplicas+=results.length-successes.length;return{operationId,acknowledged:true,sequence,replicas:successes.map(x=>x.replicaId),degraded:successes.length<this.n};}
+  async #readAll(collection,id){return(await Promise.all(this.replicaIds.map(async replicaId=>{const db=this.replicas.get(replicaId);try{return{replicaId,record:db.collection(collection).get(id),sequence:db.sequence??0};}catch{return null;}}))).filter(Boolean);}
+  async #repair(collection,id,chosen){for(const replicaId of this.replicaIds){if(replicaId===chosen.replicaId)continue;const db=this.replicas.get(replicaId);try{const current=db.collection(collection).get(id);if(JSON.stringify(current)===JSON.stringify(chosen.record))continue;if(chosen.record)await db.collection(collection).upsert(chosen.record);else await db.collection(collection).remove(id);this.metrics.repairs++;}catch{this.metrics.failedReplicas++;}}}
+  #serializeIf(enabled,fn){if(!enabled)return fn();const op=this.serial.then(fn);this.serial=op.catch(()=>undefined);return op;}
+  status(){return{replicas:this.n,writeQuorum:this.writeQuorum,readQuorum:this.readQuorum,metrics:{...this.metrics},sessions:this.session.size};}
+}
+
+export class DurablePartitionParticipant {
+  constructor(id,db,file,state){this.id=id;this.db=db;this.file=path.resolve(file);this.state=state;this.queue=Promise.resolve();}
+  static async open(id,db,file){if(!id||!db?.transaction)throw new TypeError('participant id and database required');let state={version:1,transactions:{}};try{state=JSON.parse(await fs.readFile(file,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}validateParticipantState(state);return new DurablePartitionParticipant(id,db,file,state);}
+  async prepare(txId,mutations){validateTxId(txId);validateMutations(mutations);return this.#enqueue(async()=>{const existing=this.state.transactions[txId];if(existing){if(existing.digest!==digest(mutations))throw protocol('transaction payload changed');return clone(existing);}const entry={txId,status:'prepared',digest:digest(mutations),mutations:clone(mutations),preparedAt:Date.now(),committedAt:null,abortedAt:null};this.state.transactions[txId]=entry;await this.#persist();return clone(entry);});}
+  async commit(txId){validateTxId(txId);return this.#enqueue(async()=>{const entry=this.state.transactions[txId];if(!entry)throw protocol('transaction not prepared');if(entry.status==='committed')return clone(entry);if(entry.status==='aborted')throw protocol('transaction already aborted');await this.db.transaction(tx=>{for(const mutation of entry.mutations)applyMutation(tx,mutation);},{origin:`distributed:${txId}`,sourceChangeId:`dtx:${this.id}:${txId}`});entry.status='committed';entry.committedAt=Date.now();await this.#persist();return clone(entry);});}
+  async abort(txId){validateTxId(txId);return this.#enqueue(async()=>{const entry=this.state.transactions[txId];if(!entry)return{txId,status:'aborted'};if(entry.status==='committed')throw protocol('cannot abort committed transaction');entry.status='aborted';entry.abortedAt=Date.now();await this.#persist();return clone(entry);});}
+  get(txId){return this.state.transactions[txId]?clone(this.state.transactions[txId]):null;}
+  unresolved(){return Object.values(this.state.transactions).filter(x=>x.status==='prepared').map(clone);}
+  #enqueue(fn){const op=this.queue.then(fn);this.queue=op.catch(()=>undefined);return op;}
+  async #persist(){await atomicJson(this.file,this.state);}
+}
+
+export class DurableTransactionCoordinator {
+  constructor(file,participants,state){this.file=path.resolve(file);this.participants=new Map(Object.entries(participants));this.state=state;this.queue=Promise.resolve();}
+  static async open(file,participants){if(!participants||typeof participants!=='object'||Array.isArray(participants)||!Object.keys(participants).length)throw new TypeError('participants required');let state={version:1,transactions:{}};try{state=JSON.parse(await fs.readFile(file,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}validateCoordinatorState(state);return new DurableTransactionCoordinator(file,participants,state);}
+  async execute(plan,{txId=crypto.randomUUID()}={}){validatePlan(plan,this.participants);return this.#enqueue(async()=>{const existing=this.state.transactions[txId];if(existing?.status==='committed')return clone(existing);if(existing&&existing.digest!==digest(plan))throw protocol('distributed transaction payload changed');const entry=existing??{txId,status:'preparing',digest:digest(plan),plan:clone(plan),prepared:[],committed:[],createdAt:Date.now(),updatedAt:Date.now()};this.state.transactions[txId]=entry;await this.#persist();try{for(const [participantId,mutations]of Object.entries(plan)){const participant=this.participants.get(participantId);await participant.prepare(txId,mutations);if(!entry.prepared.includes(participantId))entry.prepared.push(participantId);entry.updatedAt=Date.now();await this.#persist();}entry.status='committing';await this.#persist();for(const participantId of Object.keys(plan).sort()){await this.participants.get(participantId).commit(txId);if(!entry.committed.includes(participantId))entry.committed.push(participantId);entry.updatedAt=Date.now();await this.#persist();}entry.status='committed';entry.updatedAt=Date.now();await this.#persist();return clone(entry);}catch(error){if(entry.status==='preparing'){entry.status='aborting';await this.#persist();for(const participantId of entry.prepared){await this.participants.get(participantId).abort(txId).catch(()=>undefined);}entry.status='aborted';entry.updatedAt=Date.now();await this.#persist();}throw error;}});}
+  async recover(){return this.#enqueue(async()=>{const results=[];for(const entry of Object.values(this.state.transactions)){if(entry.status==='committing'){for(const participantId of Object.keys(entry.plan).sort()){if(entry.committed.includes(participantId))continue;await this.participants.get(participantId).commit(entry.txId);entry.committed.push(participantId);await this.#persist();}entry.status='committed';entry.updatedAt=Date.now();await this.#persist();results.push({txId:entry.txId,status:'committed'});}else if(entry.status==='preparing'||entry.status==='aborting'){for(const participantId of entry.prepared)await this.participants.get(participantId).abort(entry.txId).catch(()=>undefined);entry.status='aborted';entry.updatedAt=Date.now();await this.#persist();results.push({txId:entry.txId,status:'aborted'});}}return results;});}
+  get(txId){return this.state.transactions[txId]?clone(this.state.transactions[txId]):null;}
+  #enqueue(fn){const op=this.queue.then(fn);this.queue=op.catch(()=>undefined);return op;}
+  async #persist(){await atomicJson(this.file,this.state);}
+}
+
+export class RegionalTopology {
+  constructor(regions,{primary=null}={}){if(!regions||typeof regions!=='object'||Array.isArray(regions)||!Object.keys(regions).length)throw new TypeError('regions required');this.regions=new Map(Object.entries(regions));this.primary=primary??[...this.regions.keys()].sort()[0];if(!this.regions.has(this.primary))throw new TypeError('unknown primary region');this.health=new Map([...this.regions.keys()].map(id=>[id,{healthy:true,latencyMs:0}]));}
+  mark(region,{healthy,latencyMs=0}){if(!this.regions.has(region))throw new TypeError('unknown region');this.health.set(region,{healthy:Boolean(healthy),latencyMs:Number(latencyMs)||0});if(region===this.primary&&!healthy)this.failover();return this.status();}
+  failover(){const candidate=[...this.health.entries()].filter(([,h])=>h.healthy).sort((a,b)=>a[1].latencyMs-b[1].latencyMs||a[0].localeCompare(b[0]))[0];if(!candidate)throw unavailable('no healthy region');this.primary=candidate[0];return this.primary;}
+  route({write=false,preferred=null}={}){if(write)return this.regions.get(this.primary);if(preferred&&this.health.get(preferred)?.healthy)return this.regions.get(preferred);const id=[...this.health.entries()].filter(([,h])=>h.healthy).sort((a,b)=>a[1].latencyMs-b[1].latencyMs)[0]?.[0];if(!id)throw unavailable('no healthy region');return this.regions.get(id);}
+  status(){return{primary:this.primary,regions:Object.fromEntries(this.health)};}
+}
+
+function applyMutation(tx,m){const c=tx.collection(m.collection);if(m.type==='remove')return c.remove(m.id);if(['put','upsert','insert'].includes(m.type))return c.put(m.record);throw new TypeError('unsupported distributed mutation');}
+function validateMutations(ms){if(!Array.isArray(ms)||!ms.length)throw new TypeError('mutations required');for(const m of ms){if(!m?.collection||!m.type)throw new TypeError('invalid mutation');if(m.type==='remove'&&!m.id)throw new TypeError('remove id required');if(['put','upsert','insert'].includes(m.type)&&!m.record?.id)throw new TypeError('record id required');}}
+function validatePlan(plan,participants){if(!plan||typeof plan!=='object'||Array.isArray(plan)||!Object.keys(plan).length)throw new TypeError('distributed transaction plan required');for(const[id,mutations]of Object.entries(plan)){if(!participants.has(id))throw new TypeError(`unknown participant ${id}`);validateMutations(mutations);}}
+function validateTxId(v){if(typeof v!=='string'||!v||v.length>256)throw new TypeError('invalid transaction id');}
+function validateParticipantState(s){if(s?.version!==1||!s.transactions||typeof s.transactions!=='object')throw protocol('invalid participant journal');}
+function validateCoordinatorState(s){if(s?.version!==1||!s.transactions||typeof s.transactions!=='object')throw protocol('invalid coordinator journal');}
+function quorum(value,n){const q=value??Math.floor(n/2)+1;if(!Number.isSafeInteger(q)||q<1||q>n)throw new TypeError('invalid quorum');return q;}
+function digest(v){return crypto.createHash('sha256').update(JSON.stringify(canonical(v))).digest('hex');}
+function canonical(v){if(Array.isArray(v))return v.map(canonical);if(v&&typeof v==='object'){const o={};for(const k of Object.keys(v).sort())o[k]=canonical(v[k]);return o;}return v;}
+async function atomicJson(file,value){await fs.mkdir(path.dirname(file),{recursive:true});const temp=`${file}.${crypto.randomUUID()}.tmp`;try{await fs.writeFile(temp,`${JSON.stringify(value)}\n`,{mode:0o600});const h=await fs.open(temp,'r');try{await h.sync();}finally{await h.close();}await fs.rename(temp,file);const d=await fs.open(path.dirname(file),'r');try{await d.sync();}finally{await d.close();}}finally{await fs.rm(temp,{force:true}).catch(()=>undefined);}}
+function protocol(message){const e=new Error(message);e.code='SYNCIO_DISTRIBUTED_PROTOCOL';return e;}
+function unavailable(message){const e=new Error(message);e.code='SYNCIO_QUORUM_UNAVAILABLE';return e;}
+function quorumError(message,details){const e=unavailable(message);e.details=details;return e;}
