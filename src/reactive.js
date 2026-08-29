@@ -14,9 +14,10 @@ export class ReactiveQueryGraph {
   }
   remove(id){const q=this.queries.get(id);if(!q)return false;this.queries.delete(id);this.byCollection.get(q.collection)?.delete(id);return true;}
   async applyCommit(commit){
-    const tasks=[];const changed=new Set((commit.mutations??[]).map(m=>m.collection));
-    for(const collection of changed)for(const id of this.byCollection.get(collection)??[]){const q=this.queries.get(id);const mutations=(commit.mutations??[]).filter(m=>m.collection===collection);if(!mutations.some(m=>mayAffect(q.deps,m)))continue;
-      const task=q.serial.then(async()=>{const next=q.incremental?applyIncremental(q.last,q.normalized,mutations):await q.evaluate();if(next.length>this.maxMaterializedRows)throw limit('reactive materialized row limit exceeded');if(stable(next)===stable(q.last))return null;q.last=clone(next);return{queryId:id,commitId:commit.commitId,value:clone(next),mode:q.incremental?'incremental':'recompute'};});q.serial=task.catch(()=>undefined);tasks.push(task);
+    const source=Array.isArray(commit?.changes)?commit.changes:(commit?.mutations??[]);const tasks=[];const changed=new Set(source.map(m=>m.collection));
+    for(const collection of changed)for(const id of this.byCollection.get(collection)??[]){const q=this.queries.get(id);const mutations=source.filter(m=>m.collection===collection);if(!mutations.some(m=>mayAffect(q.deps,m)))continue;
+      const canIncrement=q.incremental&&mutations.every(hasRowIdentity);
+      const task=q.serial.then(async()=>{const next=canIncrement?applyIncremental(q.last,q.normalized,mutations):await q.evaluate();if(!Array.isArray(next))throw new TypeError('reactive query evaluator must return an array');if(next.length>this.maxMaterializedRows)throw limit('reactive materialized row limit exceeded');if(stable(next)===stable(q.last))return null;q.last=clone(next);return{queryId:id,commitId:commit.commitId,value:clone(next),mode:canIncrement?'incremental':'recompute'};});q.serial=task.catch(()=>undefined);tasks.push(task);
     }
     return (await Promise.all(tasks)).filter(Boolean);
   }
@@ -25,7 +26,8 @@ export class ReactiveQueryGraph {
 
 function normalizeQuery(query){if(query&&Object.hasOwn(query,'where'))return clone(query);return{where:clone(query??{})};}
 function isIncrementalSafe(spec){return !spec.orderBy&&!spec.limit&&!spec.offset&&!spec.projection;}
-function applyIncremental(current,spec,mutations){const map=new Map(current.map(r=>[r.id,clone(r)]));for(const mutation of mutations){if(mutation.before?.id)map.delete(mutation.before.id);if(mutation.record&&matches(mutation.record,spec.where))map.set(mutation.record.id,clone(mutation.record));}return[...map.values()].sort((a,b)=>String(a.id).localeCompare(String(b.id)));}
+function hasRowIdentity(mutation){return typeof(mutation?.id??mutation?.before?.id??mutation?.record?.id)==='string';}
+function applyIncremental(current,spec,mutations){const map=new Map(current.map(r=>[r.id,clone(r)]));for(const mutation of mutations){const id=mutation.id??mutation.before?.id??mutation.record?.id;if(id)map.delete(id);if(mutation.record&&matches(mutation.record,spec.where))map.set(mutation.record.id,clone(mutation.record));}return[...map.values()].sort((a,b)=>String(a.id).localeCompare(String(b.id)));}
 function matches(record,where){return queryRecords([record],{where}).length===1;}
 function compileDependencies(query){const out=[];walk(query?.where??query,'',out);return out.length?out:[{path:'*'}];}
 function walk(v,p,out){if(!v||typeof v!=='object'||Array.isArray(v))return;for(const[k,x]of Object.entries(v)){if(k.startsWith('$')){walk(x,p,out);continue;}const path=p?`${p}.${k}`:k;out.push({path});walk(x,path,out);}}
