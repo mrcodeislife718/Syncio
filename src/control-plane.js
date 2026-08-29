@@ -3,10 +3,12 @@ import path from 'node:path';
 import { SyncioDatabase } from './index.js';
 import { createTokenAuthority } from './operations.js';
 
+const SCALE_ENTITLEMENTS=['database','realtime:basic','realtime:extended','backups','pitr','higher-limits','audit','priority-support','multi-region','replicas'];
 const PLAN_ENTITLEMENTS = Object.freeze({
   free: ['database','realtime:basic'],
-  pro: ['database','realtime:basic','realtime:extended','backups','higher-limits'],
-  business: ['database','realtime:basic','realtime:extended','backups','higher-limits','audit','priority-support'],
+  pro: ['database','realtime:basic','realtime:extended','backups','pitr:basic','higher-limits'],
+  scale: SCALE_ENTITLEMENTS,
+  business: SCALE_ENTITLEMENTS,
   enterprise: ['*']
 });
 
@@ -46,7 +48,7 @@ export class SyncioControlPlane {
     if (typeof name !== 'string' || !name.trim() || name.length > 120) throw new TypeError('project name required');
     validatePlan(plan);
     const now = new Date().toISOString();
-    const project={ id:crypto.randomUUID(), accountId, name:name.trim(), plan, status:'active', createdAt:now, updatedAt:now };
+    const project={ id:crypto.randomUUID(), accountId, name:name.trim(), plan, billingStatus:'active', status:'active', createdAt:now, updatedAt:now };
     await this.db.transaction(async(tx)=>{
       const currentAccount=tx.collection('_accounts').get(accountId);
       if(!currentAccount||currentAccount.status!=='active')throw notFound('account_not_found');
@@ -93,7 +95,7 @@ export class SyncioControlPlane {
     const project=this.project(projectId);
     const account=this.db.collection('_accounts').get(tokenUser.sub);
     if(!project||project.accountId!==tokenUser.sub||!account||account.status!=='active')return null;
-    return { ...tokenUser, entitlements:this.entitlements(projectId), plan:project.plan };
+    return { ...tokenUser, entitlements:this.entitlements(projectId), plan:project.plan, billingStatus:project.billingStatus??'active' };
   }
 
   projectStorageFile(projectId) {
@@ -106,12 +108,15 @@ export class SyncioControlPlane {
     const account = this.db.collection('_accounts').get(accountId);
     if (!account) throw notFound('account_not_found');
     const projects = this.db.collection('_projects').all().filter((project)=>project.accountId===accountId);
+    const ids=new Set(projects.map((project)=>project.id));
     return {
       exportedAt:new Date().toISOString(),
       account,
       projects,
       entitlements:Object.fromEntries(projects.map((project)=>[project.id,this.entitlements(project.id)])),
-      billingEvents:this.db.collection('_billing_events').all().filter((event)=>projects.some((project)=>project.id===event.projectId))
+      billingEvents:this.db.collection('_billing_events').all().filter((event)=>ids.has(event.projectId)),
+      invoices:this.db.collection('_invoices').all().filter((invoice)=>ids.has(invoice.projectId)),
+      usageEvents:this.db.collection('_usage_events').all().filter((event)=>ids.has(event.projectId))
     };
   }
 
@@ -154,7 +159,7 @@ export class BillingStateProcessor {
       const project=projects.get(projectId);
       if(!project||project.status!=='active')throw notFound('project_not_found');
       const now=new Date().toISOString();
-      projects.put({...project,plan:targetPlan,updatedAt:now});
+      projects.put({...project,plan:targetPlan,billingStatus:status==='past_due'?'past_due':'active',updatedAt:now});
       tx.collection('_entitlements').put({id:projectId,projectId,grants:[...PLAN_ENTITLEMENTS[targetPlan]],source:`billing:${provider}${targetPlan==='free'?':cancelled':''}`,externalReference:id,updatedAt:now});
       events.put({id,projectId,type,plan:plan??null,status,provider,occurredAt,processedAt:now});
     });
@@ -164,6 +169,7 @@ export class BillingStateProcessor {
 }
 
 export function planEntitlements(plan) { validatePlan(plan); return [...PLAN_ENTITLEMENTS[plan]]; }
+export function supportedPlans(){return Object.keys(PLAN_ENTITLEMENTS);}
 
 function validatePlan(plan) { if (!Object.hasOwn(PLAN_ENTITLEMENTS, plan)) throw new TypeError(`unknown Syncio plan: ${plan}`); }
 function hashEmail(email){return crypto.createHash('sha256').update(email).digest('hex');}
