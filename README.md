@@ -1,55 +1,51 @@
 # Syncio
 
-Syncio is a lightweight realtime document database designed to combine rich document-database capability with a small operational footprint, durable offline synchronization, and resumable realtime data delivery.
+Syncio is a lightweight realtime document database designed to combine rich document-database capability with a small operational footprint, durable offline synchronization, resumable realtime delivery, bounded-memory storage, and optional distributed operation.
 
 The product target is:
 
 - rich document capability comparable to the reasons developers choose MongoDB;
-- operational lightness, fast hot-data access, and inexpensive writes associated with Redis-class systems;
+- operational lightness, bounded hot-memory use, and inexpensive writes associated with Redis-class systems;
 - realtime and offline behavior built into the database rather than bolted on as a separate service;
 - self-hosting and provider independence;
 - a managed Syncio Cloud path that turns the same database into recurring infrastructure revenue.
 
 ## Current status
 
-Syncio is under active production qualification. The repository contains the embedded database, authenticated self-host runtime, process-isolated managed runtime, control plane, usage/invoice engine, payment-provider boundary, TLS edge, deployment/rollback primitives, and production verification suites. Public managed-cloud launch still requires the external production environment and the final evidence gates documented in `docs/COMPLETION_LEDGER.md` and `docs/PRODUCTION_QUALIFICATION.md`.
+The technical-superiority implementation is integrated into the production/self-host runtime and qualification suite. The repository contains the embedded database, storage-backed production engine, authenticated self-host runtime, managed runtime, control plane, usage/invoice engine, provider-neutral payment boundary, TLS edge, deployment/rollback primitives, bounded indexes, distributed partition groups, durable cross-shard transactions, regional failover, and production verification suites.
 
-## Core architecture
+Public managed-cloud launch still depends on external production evidence such as the real deployment environment, live payment provider, public DNS/TLS operations, protected repository governance, customer operations, and direct competitor benchmark runs. Those external gates are tracked separately from implementation completeness in `docs/COMPLETION_LEDGER.md` and `docs/PRODUCTION_QUALIFICATION.md`.
 
-A successful mutation follows one ordered path:
+## One authoritative commit path
+
+A successful production mutation follows one ordered path:
 
 ```text
 client write
   -> validation and authorization
-  -> transaction/conflict control
-  -> fsynced append-only durable log
-  -> committed document state
-  -> index maintenance
-  -> realtime change stream
-  -> replication/offline synchronization history
-  -> checkpoint / compaction / recovery
+  -> write-set / OCC transaction control
+  -> resource admission
+  -> Commit Fabric identity + checksum
+  -> fsynced WAL
+  -> authoritative segmented SSD state
+  -> bounded persistent index maintenance
+  -> committed change stream
+      -> realtime
+      -> reactive queries
+      -> replication
+      -> selective/offline sync
+      -> PITR / recovery
 ```
 
-The same committed change drives local watchers, network realtime, replication, reconnect replay, offline synchronization, TTL removal, recovery history, and operational observation.
+A specialized subsystem may optimize this path, but it cannot create a second source of truth. If an index becomes unavailable after a durable commit, the production boundary marks the index degraded and falls back to authoritative SSD state until repair completes.
 
 ## Document capability
 
-Syncio supports nested JSON documents and arrays, dotted-path queries, logical/comparison/array operators, projections, sorting and pagination, persistent single/compound/unique indexes, atomic document updates, multi-document transactions, aggregation, schema validation, TTL expiration, text search, geospatial search, point-in-time recovery, partition routing/rebalancing, and resumable realtime streams.
+Syncio supports nested JSON documents and arrays, dotted-path queries, logical/comparison/array operators, projections, sorting and pagination, persistent single/compound/unique/sparse indexes, atomic document updates, multi-document transactions, aggregation, schema validation, TTL expiration, persistent text search, persistent geospatial search, point-in-time recovery, partition routing/rebalancing, and resumable realtime streams.
 
-Examples include:
+Index keys use canonical typed encoding so missing values, nulls, numbers, strings, arrays, and structurally equivalent objects do not collapse incorrectly.
 
-```text
-customer.address.city = "Bronx"
-total >= 25
-$and / $or / $nor
-$in / $nin / $exists / $all / $elemMatch
-$set / $unset / $inc / $mul / $min / $max
-$push / $addToSet / $pull / $rename
-$text
-$near
-```
-
-## Realtime and offline
+## Realtime, reactive queries, and offline sync
 
 Collection streams resume from a durable sequence:
 
@@ -57,15 +53,47 @@ Collection streams resume from a durable sequence:
 GET /subscribe/orders?after=88201
 ```
 
-Every delivered change carries a sequence ID. Clients can reconnect with `after=<sequence>` or `Last-Event-ID`; retained missed changes are replayed before live delivery resumes. Expired history produces an explicit reseed requirement rather than silent divergence.
+Every delivered change carries a sequence ID. Clients reconnect with `after=<sequence>` or `Last-Event-ID`; retained missed changes are replayed before live delivery resumes. Expired history produces an explicit reseed requirement rather than silent divergence.
 
-Restart-persistent offline queues use stable idempotency identities so retries do not intentionally create duplicate remote changes.
+Reactive queries consume real Commit Fabric mutations. Safe query shapes are maintained incrementally; incomplete deltas or query shapes that cannot be updated safely fall back to recomputation rather than returning stale results.
 
-## Storage direction
+Persistent Sync Views provide bounded selective synchronization. Restart-persistent transaction intents retain preconditions, conflict policy, retry state, expiry, and idempotent identity, and reconcile through the real transaction engine.
 
-Normal commits use WAL-first persistence instead of rewriting the complete database file per mutation. Syncio also contains a segmented SSD-backed state plane with persisted offsets, bounded hot-record cache, streaming scans, tombstones and compaction.
+## Storage and bounded memory
 
-The remaining large-dataset qualification work is to finish proving the default compatibility database path on the segmented/write-set architecture at the intended 1x/10x/100x workloads. The repository does not claim a 500 GB low-RAM production ceiling until that evidence exists.
+The production state plane uses segmented SSD files as authoritative state. Normal commits do not rewrite or clone the full database. Transactions use read/write sets and optimistic concurrency control.
+
+Primary offsets, ordinary secondary indexes, text postings, and geo cells are persisted in hashed buckets with bounded caches. Record-version conflict checks come from persistent offset metadata instead of one RAM entry per document. Hot record caches and index caches expose hit/miss/eviction telemetry.
+
+Compaction uses a sibling replacement directory with rollback-safe replacement. WAL recovery verifies Commit Fabric identities and emits a recovery manifest.
+
+The architecture therefore does not require the complete logical dataset to remain resident in RAM. The exact maximum dataset size remains hardware/workload dependent and is established by benchmark evidence rather than a hard-coded marketing claim.
+
+## Distributed operation
+
+Syncio includes optional distributed primitives rather than forcing distributed complexity onto every deployment:
+
+- deterministic consistent-hash partitioning and targeted shard-key queries;
+- overlapping read/write quorum partition groups;
+- read repair and minority-replica repair;
+- rollback of successful minority writes when quorum cannot be reached;
+- session monotonic/read-your-writes behavior;
+- durable two-phase cross-partition transactions;
+- participant key reservations that block conflicting routed writes while prepared;
+- recovery that completes transactions after a durable commit decision;
+- append-only tamper-evident global commit metadata;
+- bounded dedicated subscription routing;
+- regional health routing and failover.
+
+Applications that only need a single local database do not pay the operational complexity of this layer.
+
+## Policy, protocols, and scheduling
+
+The policy plane remains deny-by-default. Declarative row constraints may be compiled into query planning only when doing so is provably safe; final record-level authorization remains authoritative. A collection-specific deny also prevents a broad wildcard operation from bypassing the narrower rule.
+
+Query, Commit, and Sync protocol structures are versioned and integrity checked. The server exposes protocol capabilities and uses a digest-verified Query IR for planned HTTP queries.
+
+A hierarchical scheduler accounts for CPU, memory, SSD I/O, network, egress, and coordination. Foreground commits, realtime, replication, TTL work, PITR snapshots, and other background work are assigned explicit priorities. Durability-critical history is never silently dropped merely because optional background capacity is constrained.
 
 ## Syncio Cloud
 
@@ -80,36 +108,41 @@ Syncio Cloud is the primary recurring-revenue product. The default commercial ca
 
 Usage is durably metered for reads, writes, storage byte-hours, realtime connection time, egress, backup storage, PITR storage, replica-region hours and compute time. The revenue engine calculates included allowances, overages, quota decisions, invoice estimates, and idempotent finalized invoices.
 
-Managed project traffic reports usage from the database process to the central control plane. Customers can inspect their own usage and invoice estimates through the hosted control API. Checkout, billing portal and cancellation routes use a provider-neutral payment adapter; paid authority changes only after verified billing events.
+## Requirements and qualification
 
-Additional commercial products are Dedicated Syncio, enterprise self-hosting/support, migration services, and a future connector/integration marketplace. See `docs/COMMERCIALIZATION.md`.
-
-## Requirements
-
-Node.js 20 or newer. The production runtime currently has no third-party package dependencies.
+Node.js 20 or newer. The runtime has no third-party package dependencies.
 
 ```bash
 npm install
 npm run qualify
+npm run benchmark
 ```
 
-## Embedded example
+The qualification workflow runs syntax checks, a closure audit, Node 20 and Node 22 tests, an independent proof gate, and a non-root production-container exercise.
+
+## Production example
 
 ```js
-import { IndexedSyncioDatabase } from './src/indexed.js';
-import { atomicUpdateDocument } from './src/document-api.js';
+import { openSuperiorProduction } from 'syncio-db/superior-production';
 
-const db = await IndexedSyncioDatabase.open('./data/app.syncio.json');
-await db.defineIndex('users', ['tenantId', 'email'], { name: 'tenant_email', unique: true });
-await db.collection('users').insert({
+const db = await openSuperiorProduction('./data/app.syncio.json');
+await db.defineIndex('users', ['tenantId', 'email'], {
+  name: 'tenant_email',
+  unique: true
+});
+
+await db.collection('users').upsert({
   id: 'u1',
   tenantId: 't1',
   email: 'ada@example.com',
   profile: { address: { city: 'Bronx' } },
   score: 10
 });
-await atomicUpdateDocument(db, 'users', 'u1', { $inc: { score: 5 }, $set: { 'profile.level': 'gold' } });
-const users = db.collection('users').query({ where: { 'profile.address.city': 'Bronx', score: { $gte: 15 } }, projection: { email: 1, score: 1 } });
+
+const users = db.collection('users').query({
+  where: { 'profile.address.city': 'Bronx', score: { $gte: 10 } }
+});
+
 console.log(users);
 await db.close();
 ```
@@ -121,4 +154,4 @@ await db.close();
 - `docs/COMPLETION_LEDGER.md` — evidence-backed capability status.
 - `docs/PRODUCTION_QUALIFICATION.md` — independent launch qualification.
 
-Passing CI means the tested guarantees passed on that exact commit. It does not convert external payment, public TLS/DNS, geographic infrastructure, competitive benchmarking, or customer adoption into evidence that has not actually been produced.
+Passing CI means the tested guarantees passed on that exact commit. It does not turn unperformed competitor benchmarks, external payment operations, public infrastructure, or customer adoption into evidence.
