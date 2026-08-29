@@ -10,6 +10,7 @@
     "./document-api": "./src/document-api.js",
     "./production-db": "./src/production-db.js",
     "./bounded-production": "./src/bounded-production.js",
+    "./resilient-production": "./src/resilient-production.js",
     "./superior-production": "./src/superior-production.js",
     "./superior-indexed": "./src/superior-indexed.js",
     "./network-db": "./src/network-db.js",
