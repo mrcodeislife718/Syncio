@@ -4,12 +4,14 @@ import { OfflineQueue, createReplicationPacket, verifyReplicationPacket, createS
 import { atomicUpdateDocument } from './document-api.js';
 import { aggregateDocuments } from './document.js';
 import { createResourcePolicy } from './resource-policy.js';
+import { compileQueryIR, verifyQueryIR, localProtocolCapabilities, encodeSyncProtocol } from './protocol.js';
+import { PRIORITY } from './scheduler.js';
 
 const DEFAULT_MAX_BODY_BYTES = 1_048_576;
 const DEFAULT_REPLICATION_LIMIT = 1_000;
 const DEFAULT_MAX_SUBSCRIPTIONS = 1_000;
 
-export function createSyncioServer({ db, policies = [], authenticate = async () => null, nodeId = db?.databaseId ?? crypto.randomUUID(), conflictStrategy = 'last-write-wins', maxBodyBytes = DEFAULT_MAX_BODY_BYTES, replicationLimit = DEFAULT_REPLICATION_LIMIT, maxSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS, observe = () => undefined } = {}) {
+export function createSyncioServer({ db, policies = [], authenticate = async () => null, nodeId = db?.databaseId ?? crypto.randomUUID(), conflictStrategy = 'last-write-wins', maxBodyBytes = DEFAULT_MAX_BODY_BYTES, replicationLimit = DEFAULT_REPLICATION_LIMIT, maxSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS, observe = () => undefined, scheduler = null } = {}) {
   if (!db) throw new Error('Syncio server requires a database');
   if (typeof db.watchChanges !== 'function' || typeof db.resumeStatus !== 'function') throw new TypeError('Syncio server requires resumable database change streams');
   if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes < 1) throw new TypeError('maxBodyBytes must be a positive safe integer');
@@ -18,6 +20,8 @@ export function createSyncioServer({ db, policies = [], authenticate = async () 
 
   const policy = createResourcePolicy(policies);
   const networkStreams = new Set();
+  const realtimeScheduler = scheduler?.child?.('realtime') ?? scheduler;
+  const replicationScheduler = scheduler?.child?.('replication') ?? scheduler;
 
   const server = http.createServer(async (req, res) => {
     const requestId = requestIdFor(req);
@@ -25,7 +29,8 @@ export function createSyncioServer({ db, policies = [], authenticate = async () 
     res.setHeader('x-syncio-request-id', requestId);
     try {
       const url = new URL(req.url, 'http://syncio.local');
-      if (req.method === 'GET' && url.pathname === '/health') return respond(res, 200, { ok: true, nodeId, sequence: db.sequence, subscriptions: networkStreams.size, storage: db.storageStatus?.() }, { observe, requestId, req, startedAt });
+      if (req.method === 'GET' && url.pathname === '/health') return respond(res, 200, { ok: true, nodeId, sequence: db.sequence, subscriptions: networkStreams.size, storage: db.storageStatus?.(), protocols: localProtocolCapabilities() }, { observe, requestId, req, startedAt });
+      if (req.method === 'GET' && url.pathname === '/protocols') return respond(res, 200, { protocols: localProtocolCapabilities() }, { observe, requestId, req, startedAt });
       const user = await authenticate(req);
       const parts = url.pathname.split('/').filter(Boolean);
 
@@ -38,9 +43,10 @@ export function createSyncioServer({ db, policies = [], authenticate = async () 
           safeObserve(observe, { type: 'replication_cursor_expired', requestId, cursor, oldestRetained: resume.oldestRetained, sequence: db.sequence });
           return respond(res, 409, { error: cursor > db.sequence ? 'cursor_ahead' : 'snapshot_required', requestId, cursor, oldestRetained: resume.oldestRetained, sequence: db.sequence }, { observe, requestId, req, startedAt });
         }
-        const changes = db.changesSince(cursor, { limit: replicationLimit });
-        const nextCursor = changes.at(-1)?.sequence ?? cursor;
-        return respond(res, 200, createReplicationPacket({ from: nodeId, cursor: nextCursor, changes }), { observe, requestId, req, startedAt });
+        const admission = admit(replicationScheduler,{priority:PRIORITY.replication,cost:{network:1,egress:Math.min(maxBodyBytes,replicationLimit*1024),memory:64*1024}});
+        if(admission?.decision&&admission.decision!=='admit') return respond(res,503,{error:'replication_resource_busy',requestId},{observe,requestId,req,startedAt});
+        try { const changes = db.changesSince(cursor, { limit: replicationLimit }); const nextCursor = changes.at(-1)?.sequence ?? cursor; return respond(res, 200, createReplicationPacket({ from: nodeId, cursor: nextCursor, changes }), { observe, requestId, req, startedAt }); }
+        finally { admission?.release?.(); }
       }
 
       if (req.method === 'POST' && url.pathname === '/replicate/snapshot') {
@@ -52,9 +58,14 @@ export function createSyncioServer({ db, policies = [], authenticate = async () 
         const body = await readJson(req, { maxBodyBytes, requireObject: true });
         if (!authorize(policy, { user, action: 'replicate', collection: '*', body }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         if (!verifyReplicationPacket(body) || !Array.isArray(body.changes)) return respond(res, 400, { error: 'invalid_replication_packet', requestId }, { observe, requestId, req, startedAt });
-        let accepted = 0; let duplicates = 0;
-        for (const change of body.changes) { const result = await applyReplicatedChange(db, change, { conflictStrategy }); if (result?.duplicate) duplicates++; else accepted++; }
-        return respond(res, 200, { ok: true, accepted, duplicates, sequence: db.sequence }, { observe, requestId, req, startedAt });
+        const admission=admit(replicationScheduler,{priority:PRIORITY.replication,cost:{network:Buffer.byteLength(JSON.stringify(body)),ssdIo:Buffer.byteLength(JSON.stringify(body)),coordination:body.changes.length}});
+        if(admission?.decision&&admission.decision!=='admit') return respond(res,503,{error:'replication_resource_busy',requestId},{observe,requestId,req,startedAt});
+        try { let accepted = 0; let duplicates = 0; for (const change of body.changes) { const result = await applyReplicatedChange(db, change, { conflictStrategy }); if (result?.duplicate) duplicates++; else accepted++; } return respond(res, 200, { ok: true, accepted, duplicates, sequence: db.sequence }, { observe, requestId, req, startedAt }); }
+        finally { admission?.release?.(); }
+      }
+
+      if (req.method === 'GET' && parts[0] === 'sync' && parts[1] && !parts[2] && typeof db.syncViewChanges === 'function') {
+        const viewName=decodeURIComponent(parts[1]);const after=normalizeCursor(url.searchParams.get('after')??0);if(!authorizeScope(policy,{user,action:'read',collection:'*'},res,requestId))return finishObserved(observe,requestId,req,res,startedAt);const result=db.syncViewChanges(viewName,after);return respond(res,200,encodeSyncProtocol({view:viewName,cursor:after,sequence:result.sequence,changes:result.changes}),{observe,requestId,req,startedAt});
       }
 
       if (req.method === 'GET' && parts[0] === 'subscribe' && parts[1] && !parts[2]) {
@@ -68,7 +79,8 @@ export function createSyncioServer({ db, policies = [], authenticate = async () 
           safeObserve(observe, { type: code, requestId, collection: collectionName, cursor: after, oldestRetained: resume.oldestRetained, sequence: db.sequence });
           return respond(res, 409, { error: code, requestId, cursor: after, oldestRetained: resume.oldestRetained, sequence: db.sequence }, { observe, requestId, req, startedAt });
         }
-        return openEventStream({ req, res, db, collectionName, after, requestId, startedAt, networkStreams, observe, policy, user });
+        const admission=admit(realtimeScheduler,{priority:PRIORITY.realtime,cost:{network:1,egress:4096,memory:8192,coordination:1}});if(admission?.decision&&admission.decision!=='admit')return respond(res,429,{error:'subscription_resource_busy',requestId},{observe,requestId,req,startedAt});
+        return openEventStream({ req, res, db, collectionName, after, requestId, startedAt, networkStreams, observe, policy, user, admission });
       }
 
       if (parts[0] !== 'collections' || !parts[1]) return respond(res, 404, { error: 'not_found', requestId }, { observe, requestId, req, startedAt });
@@ -79,23 +91,26 @@ export function createSyncioServer({ db, policies = [], authenticate = async () 
 
       if (req.method === 'POST' && aggregateRoute) {
         const body = await readJson(req, { maxBodyBytes, requireObject: true });
-        if (!authorizeScope(policy, { user, action: 'read', collection: collectionName, body }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
+        const context={ user, action: 'read', collection: collectionName, body };
+        if (!authorizeScope(policy, context, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         if (!Array.isArray(body.pipeline)) throw clientError(400, 'aggregation_pipeline_required');
-        const visible = visibleRecords(policy, { user, action: 'read', collection: collectionName }, collectionCandidates(collection, {}));
+        const constraint=policy.queryConstraint(context);const planned=compileQueryIR({collection:collectionName,where:{},policyConstraints:constraint??{}});if(!verifyQueryIR(planned))throw clientError(500,'query_plan_integrity_failed');
+        const visible = visibleRecords(policy, context, collectionCandidates(collection, {where:planned.where}));
         return respond(res, 200, { records: aggregateDocuments(visible, body.pipeline) }, { observe, requestId, req, startedAt });
       }
 
       if (req.method === 'GET') {
-        if (!authorizeScope(policy, { user, action: 'read', collection: collectionName, id }, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
+        const context={ user, action: 'read', collection: collectionName, id };
+        if (!authorizeScope(policy, context, res, requestId)) return finishObserved(observe, requestId, req, res, startedAt);
         if (!id) {
-          const query = parseQuery(url);
-          const candidates = collectionCandidates(collection, { where: query.where });
-          const visible = visibleRecords(policy, { user, action: 'read', collection: collectionName }, candidates);
-          return respond(res, 200, { records: queryRecords(visible, { ...query, where: undefined }) }, { observe, requestId, req, startedAt });
+          const query = parseQuery(url),constraint=policy.queryConstraint(context);const planned=compileQueryIR({collection:collectionName,where:query.where??{},projection:query.projection,orderBy:query.orderBy,limit:query.limit,offset:query.offset??0,policyConstraints:constraint??{}});if(!verifyQueryIR(planned))throw clientError(500,'query_plan_integrity_failed');
+          const candidates = collectionCandidates(collection, { where: planned.where });
+          const visible = visibleRecords(policy, context, candidates);
+          return respond(res, 200, { records: queryRecords(visible, { projection:query.projection,orderBy:query.orderBy,limit:query.limit,offset:query.offset }) }, { observe, requestId, req, startedAt });
         }
         const record = collection.get(id);
         if (!record) return respond(res, 404, { error: 'not_found', requestId }, { observe, requestId, req, startedAt });
-        const visible = policy.read({ user, action: 'read', collection: collectionName, id }, record);
+        const visible = policy.read(context, record);
         return visible ? respond(res, 200, visible, { observe, requestId, req, startedAt }) : respond(res, 404, { error: 'not_found', requestId }, { observe, requestId, req, startedAt });
       }
 
@@ -166,15 +181,16 @@ export async function applyReplicatedChange(db, change, { conflictStrategy = 'la
   const incoming = change.record; if (!incoming?.id) throw new Error('replicated record requires id'); const current = collection.get(incoming.id); const resolved = resolveConflict(current, incoming, conflictStrategy); await collection.upsert(resolved); return { applied: true, duplicate: false };
 }
 
-function openEventStream({ req, res, db, collectionName, after, requestId, startedAt, networkStreams, observe, policy, user }) {
+function openEventStream({ req, res, db, collectionName, after, requestId, startedAt, networkStreams, observe, policy, user, admission }) {
   res.statusCode = 200; res.setHeader('content-type', 'text/event-stream; charset=utf-8'); res.setHeader('cache-control', 'no-cache, no-transform'); res.setHeader('connection', 'keep-alive'); res.flushHeaders?.(); networkStreams.add(res);
   let closed = false; let stop; let heartbeat;
-  const cleanup = (reason = 'closed') => { if (closed) return; closed = true; if (heartbeat) clearInterval(heartbeat); stop?.(); networkStreams.delete(res); safeObserve(observe, { type: 'subscription_closed', requestId, collection: collectionName, reason, durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000 }); };
+  const cleanup = (reason = 'closed') => { if (closed) return; closed = true; if (heartbeat) clearInterval(heartbeat); stop?.(); admission?.release?.(); networkStreams.delete(res); safeObserve(observe, { type: 'subscription_closed', requestId, collection: collectionName, reason, durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000 }); };
   const send = (eventName, data, id) => { if (closed || res.writableEnded) return false; const idLine = id === undefined ? '' : `id: ${id}\n`; const ok = res.write(`${idLine}event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`); if (!ok) { safeObserve(observe, { type: 'subscription_backpressure', requestId, collection: collectionName }); cleanup('backpressure'); res.end(); return false; } return true; };
   const sendChange = (change) => { const resource = change.record ?? { id: change.id }; const visible = policy.read({ user, action: 'read', collection: collectionName, id: resource.id }, resource); if (!visible) return true; const filtered = { ...change, ...(change.record ? { record: visible } : {}) }; return send('change', filtered, change.sequence); };
   heartbeat = setInterval(() => send('heartbeat', { sequence: db.sequence }), 15_000); heartbeat.unref?.(); req.once('close', () => cleanup('client_closed')); res.once('close', () => cleanup('response_closed')); send('ready', { collection: collectionName, sequence: db.sequence, resumeFrom: after, requestId }); stop = db.watchChanges({ collection: collectionName, after }, sendChange); safeObserve(observe, { type: 'subscription_opened', requestId, collection: collectionName, resumeFrom: after });
 }
 
+function admit(scheduler,task){if(!scheduler?.admit)return null;return scheduler.admit(task);}
 function collectionCandidates(collection, spec) { return typeof collection.query === 'function' ? collection.query(spec) : queryRecords(collection.all(), spec); }
 function visibleRecords(policy, context, records) { return records.map((record) => policy.read({ ...context, id: record.id }, record)).filter(Boolean); }
 function subscriptionCursor(req, url, currentSequence) { if (url.searchParams.has('after')) return normalizeCursor(url.searchParams.get('after')); const lastEventId = req.headers['last-event-id']; if (typeof lastEventId === 'string' && lastEventId.length) return normalizeCursor(lastEventId); return currentSequence; }
