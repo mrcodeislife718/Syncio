@@ -1,6 +1,6 @@
 {
   "name": "syncio-db",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Syncio lightweight realtime document database.",
   "type": "module",
   "exports": {
@@ -49,14 +49,21 @@
     "./locality": "./src/locality.js",
     "./recovery-manifest": "./src/recovery-manifest.js"
   },
-  "bin": {"syncio-server":"./bin/syncio-server.js","syncio-control":"./bin/syncio-control.js"},
-  "scripts": {
-    "test":"node --test",
-    "check":"for f in src/*.js bin/*.js scripts/*.mjs; do node --check \"$f\" || exit 1; done",
-    "audit:closure":"node scripts/closure-audit.mjs",
-    "benchmark":"node scripts/benchmark.mjs",
-    "qualify":"npm run check && npm run audit:closure && npm test"
+  "bin": {
+    "syncio-server": "./bin/syncio-server.js",
+    "syncio-control": "./bin/syncio-control.js"
   },
-  "engines":{"node":">=20"},
-  "license":"MIT"
+  "scripts": {
+    "test": "node --test",
+    "check": "for f in src/*.js bin/*.js scripts/*.mjs; do node --check \"$f\" || exit 1; done",
+    "check:public-api": "node scripts/public-api-check.mjs",
+    "audit:closure": "node scripts/closure-audit.mjs",
+    "benchmark": "node scripts/benchmark.mjs",
+    "benchmark:compare": "node scripts/benchmark-compare.mjs",
+    "qualify": "npm run check && npm run check:public-api && npm run audit:closure && npm test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
 }
