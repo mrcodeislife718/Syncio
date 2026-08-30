@@ -1,6 +1,6 @@
 {
   "name": "syncio-db",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Syncio lightweight realtime document database.",
   "type": "module",
   "exports": {
@@ -47,7 +47,8 @@
     "./consistency": "./src/consistency.js",
     "./policy-compiler": "./src/policy-compiler.js",
     "./locality": "./src/locality.js",
-    "./recovery-manifest": "./src/recovery-manifest.js"
+    "./recovery-manifest": "./src/recovery-manifest.js",
+    "./superiority-v2": "./src/superiority-v2.js"
   },
   "bin": {
     "syncio-server": "./bin/syncio-server.js",
@@ -60,8 +61,9 @@
     "audit:closure": "node scripts/closure-audit.mjs",
     "benchmark": "node scripts/benchmark.mjs",
     "benchmark:compare": "node scripts/benchmark-compare.mjs",
+    "qualify:evidence": "node scripts/superiority-v2-evidence.mjs",
     "qualify:external": "node scripts/external-qualification.mjs",
-    "qualify": "npm run check && npm run check:public-api && npm run audit:closure && npm test"
+    "qualify": "npm run check && npm run check:public-api && npm run audit:closure && npm run qualify:evidence && npm test"
   },
   "engines": {
     "node": ">=20"
