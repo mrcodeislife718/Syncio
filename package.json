@@ -60,6 +60,7 @@
     "audit:closure": "node scripts/closure-audit.mjs",
     "benchmark": "node scripts/benchmark.mjs",
     "benchmark:compare": "node scripts/benchmark-compare.mjs",
+    "qualify:external": "node scripts/external-qualification.mjs",
     "qualify": "npm run check && npm run check:public-api && npm run audit:closure && npm test"
   },
   "engines": {
