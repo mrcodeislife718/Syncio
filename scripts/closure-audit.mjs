@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 const roots=['src','test','bin','scripts'];
+const self=path.normalize('scripts/closure-audit.mjs');
 const forbidden=[
   {name:'TODO',pattern:/\bTODO\b/},
   {name:'FIXME',pattern:/\bFIXME\b/},
@@ -15,7 +16,7 @@ const forbidden=[
 const findings=[];
 for(const root of roots) {
   for(const file of await walk(root)) {
-    if(!/\.(?:js|mjs|cjs)$/.test(file))continue;
+    if(path.normalize(file)===self||!/\.(?:js|mjs|cjs)$/.test(file))continue;
     const text=await fs.readFile(file,'utf8');
     const lines=text.split('\n');
     lines.forEach((line,index)=>{
