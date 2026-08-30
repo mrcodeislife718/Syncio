@@ -14,11 +14,11 @@ The product target is:
 
 The technical-superiority implementation is integrated into the production/self-host runtime and qualification suite. The repository contains the embedded database, storage-backed production engine, authenticated self-host runtime, managed runtime, control plane, usage/invoice engine, provider-neutral payment boundary, TLS edge, deployment/rollback primitives, bounded indexes, distributed partition groups, durable cross-shard transactions, regional failover, and production verification suites.
 
+Repository-side qualification gaps have also been closed: deterministic disk-full/read-only WAL failure tests, package export/import verification, production-path repeated benchmarking, strict same-hardware/workload comparison gates, and an executable public-deployment qualification command.
+
 Public managed-cloud launch still depends on external production evidence such as the real deployment environment, live payment provider, public DNS/TLS operations, protected repository governance, customer operations, and direct competitor benchmark runs. Those external gates are tracked separately from implementation completeness in `docs/COMPLETION_LEDGER.md` and `docs/PRODUCTION_QUALIFICATION.md`.
 
 ## One authoritative commit path
-
-A successful production mutation follows one ordered path:
 
 ```text
 client write
@@ -65,7 +65,7 @@ The production state plane uses segmented SSD files as authoritative state. Norm
 
 Primary offsets, ordinary secondary indexes, text postings, and geo cells are persisted in hashed buckets with bounded caches. Record-version conflict checks come from persistent offset metadata instead of one RAM entry per document. Hot record caches and index caches expose hit/miss/eviction telemetry.
 
-Compaction uses a sibling replacement directory with rollback-safe replacement. WAL recovery verifies Commit Fabric identities and emits a recovery manifest.
+Compaction uses a sibling replacement directory with rollback-safe replacement. WAL recovery verifies Commit Fabric identities and emits a recovery manifest. The WAL layer supports deterministic I/O fault injection for qualification while production defaults remain the real filesystem.
 
 The architecture therefore does not require the complete logical dataset to remain resident in RAM. The exact maximum dataset size remains hardware/workload dependent and is established by benchmark evidence rather than a hard-coded marketing claim.
 
@@ -118,7 +118,23 @@ npm run qualify
 npm run benchmark
 ```
 
-The qualification workflow runs syntax checks, a closure audit, Node 20 and Node 22 tests, an independent proof gate, and a non-root production-container exercise.
+`npm run qualify` checks syntax, imports every declared package export, audits runtime/test/CLI/qualification code for unfinished or disabled work, and runs the complete Node test suite. CI repeats qualification on Node 20 and Node 22, runs an independent proof gate, and boots the non-root production container.
+
+To compare benchmark reports, Syncio refuses mismatched hardware or workloads:
+
+```bash
+npm run benchmark:compare -- syncio.json baseline.json
+```
+
+To qualify a real public deployment:
+
+```bash
+SYNCIO_PUBLIC_BASE_URL=https://db.example.com \
+SYNCIO_PUBLIC_TOKEN='<real qualification token>' \
+npm run qualify:external
+```
+
+The external gate validates HTTPS certificate health, `/health`, protocol compatibility, authenticated write/read persistence, anonymous denial, and cleanup.
 
 ## Production example
 
@@ -154,4 +170,4 @@ await db.close();
 - `docs/COMPLETION_LEDGER.md` — evidence-backed capability status.
 - `docs/PRODUCTION_QUALIFICATION.md` — independent launch qualification.
 
-Passing CI means the tested guarantees passed on that exact commit. It does not turn unperformed competitor benchmarks, external payment operations, public infrastructure, or customer adoption into evidence.
+Passing CI means the tested guarantees passed on that exact commit. It does not turn unperformed competitor benchmarks, external payment operations, public infrastructure, protected-branch governance, or customer adoption into evidence.
