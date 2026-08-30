@@ -5,16 +5,17 @@ import crypto from 'node:crypto';
 const FORMAT = 'syncio-wal/1';
 
 export class WriteAheadLog {
-  constructor(file, entries = []) {
+  constructor(file, entries = [], { io = fs } = {}) {
     this.file = path.resolve(file);
     this.entries = entries;
+    this.io = io;
     this.queue = Promise.resolve();
   }
 
-  static async open(file) {
+  static async open(file, { io = fs } = {}) {
     const target = path.resolve(file);
-    const entries = await readWalEntries(target);
-    return new WriteAheadLog(target, entries);
+    const entries = await readWalEntries(target, { io });
+    return new WriteAheadLog(target, entries, { io });
   }
 
   listAfter(sequence = 0) {
@@ -37,8 +38,9 @@ export class WriteAheadLog {
     };
     const entry = { ...payload, digest: digest(payload) };
     return this.#enqueue(async () => {
-      await fs.mkdir(path.dirname(this.file), { recursive: true });
-      const handle = await fs.open(this.file, 'a', 0o600);
+      const io = this.io;
+      await io.mkdir(path.dirname(this.file), { recursive: true });
+      const handle = await io.open(this.file, 'a', 0o600);
       try {
         await handle.writeFile(`${JSON.stringify(entry)}\n`, 'utf8');
         await handle.sync();
@@ -54,7 +56,7 @@ export class WriteAheadLog {
     assertSequence(sequence, 'WAL compaction sequence');
     return this.#enqueue(async () => {
       const remaining = this.entries.filter((entry) => entry.resultSequence > sequence);
-      await atomicReplace(this.file, remaining.map((entry) => `${JSON.stringify(entry)}\n`).join(''));
+      await atomicReplace(this.file, remaining.map((entry) => `${JSON.stringify(entry)}\n`).join(''), { io: this.io });
       this.entries = remaining;
       return remaining.length;
     });
@@ -62,7 +64,7 @@ export class WriteAheadLog {
 
   async reset() {
     return this.#enqueue(async () => {
-      await atomicReplace(this.file, '');
+      await atomicReplace(this.file, '', { io: this.io });
       this.entries = [];
     });
   }
@@ -76,9 +78,9 @@ export class WriteAheadLog {
   }
 }
 
-export async function readWalEntries(file) {
+export async function readWalEntries(file, { io = fs } = {}) {
   let text;
-  try { text = await fs.readFile(file, 'utf8'); }
+  try { text = await io.readFile(file, 'utf8'); }
   catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   const terminated = text.endsWith('\n');
   const lines = text.split('\n');
@@ -135,17 +137,17 @@ function digest(value) {
   return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
-async function atomicReplace(target, data) {
-  await fs.mkdir(path.dirname(target), { recursive: true });
+async function atomicReplace(target, data, { io = fs } = {}) {
+  await io.mkdir(path.dirname(target), { recursive: true });
   const temp = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`;
   try {
-    await fs.writeFile(temp, data, { encoding: 'utf8', mode: 0o600 });
-    const handle = await fs.open(temp, 'r');
+    await io.writeFile(temp, data, { encoding: 'utf8', mode: 0o600 });
+    const handle = await io.open(temp, 'r');
     try { await handle.sync(); } finally { await handle.close(); }
-    await fs.rename(temp, target);
-    const directory = await fs.open(path.dirname(target), 'r');
+    await io.rename(temp, target);
+    const directory = await io.open(path.dirname(target), 'r');
     try { await directory.sync(); } finally { await directory.close(); }
   } finally {
-    await fs.rm(temp, { force: true }).catch(() => undefined);
+    await io.rm(temp, { force: true }).catch(() => undefined);
   }
 }

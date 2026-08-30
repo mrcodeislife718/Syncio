@@ -1,19 +1,22 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-const roots=['src','test','bin'];
+const roots=['src','test','bin','scripts'];
+const self=path.normalize('scripts/closure-audit.mjs');
 const forbidden=[
   {name:'TODO',pattern:/\bTODO\b/},
   {name:'FIXME',pattern:/\bFIXME\b/},
   {name:'placeholder',pattern:/\bplaceholder\b/i},
   {name:'not implemented',pattern:/\bnot implemented\b/i},
   {name:'skipped node:test',pattern:/\btest\.skip\s*\(/},
-  {name:'skipped test option',pattern:/\bskip\s*:\s*true\b/}
+  {name:'skipped test option',pattern:/\bskip\s*:\s*true\b/},
+  {name:'focused test',pattern:/\b(?:test|describe|it)\.only\s*\(/},
+  {name:'disabled test option',pattern:/\b(?:todo|only)\s*:\s*true\b/}
 ];
 const findings=[];
 for(const root of roots) {
   for(const file of await walk(root)) {
-    if(!/\.(?:js|mjs|cjs)$/.test(file))continue;
+    if(path.normalize(file)===self||!/\.(?:js|mjs|cjs)$/.test(file))continue;
     const text=await fs.readFile(file,'utf8');
     const lines=text.split('\n');
     lines.forEach((line,index)=>{
