@@ -2,82 +2,45 @@
 
 Status vocabulary: **PROVEN**, **PARTIALLY_PROVEN**, **UNVERIFIED**, **FAILED**.
 
-A capability is PROVEN only when repository evidence exercises the implemented production path. This ledger separates **technical implementation completeness** from external launch/commercial evidence.
+A capability is PROVEN only when repository evidence exercises the implemented production path. Repository implementation completeness is kept separate from external deployment, market, and competitor evidence.
 
 ## Technical product capability
 
+The core technical-superiority architecture remains **PROVEN**: segmented SSD authority, bounded primary/secondary/text/geo indexes, write-set/OCC transactions, WAL + Commit Fabric recovery, realtime/replay, reactive queries, Sync Views, offline transaction intents, schema/TTL, text/geo search, compiled policy planning, versioned Query/Commit/Sync protocols, hierarchical resource scheduling, deterministic sharding, quorum replication/read repair, durable cross-shard transactions with reservations/recovery, regional failover, global commit metadata, bounded subscription routing, authentication/revocation, TLS, PITR, telemetry/SLO plumbing, managed runtime/control plane, billing state, deployment rollback, and non-root self-host operation.
+
+## Final repository gap-closure evidence
+
+Exact pre-documentation qualification head: `8e33ba1ad1c93bcb8c57520a59b650942def33b9`.
+
+- Node 20 qualification: **PASS**
+- Node 22 qualification: **PASS**
+- tests: **174 passed / 0 failed / 0 skipped / 0 todo**
+- proof gate: **PASS**
+- production container: **PASS**
+- package public-surface gate: **PASS — 44 exports / 2 CLI binaries import or resolve correctly**
+- closure audit: **PASS** across `src`, `test`, `bin`, and `scripts`
+- dependency installation audit: **0 package vulnerabilities**
+
+## Gaps closed in the final qualification tranche
+
 | Capability | Status | Evidence / boundary |
 | --- | --- | --- |
-| Storage-backed production engine | PROVEN | Segmented SSD state is authoritative; normal production writes use write-set/OCC transactions rather than whole-database drafts. |
-| Bounded primary metadata | PROVEN | Offset metadata is persistent/bucketed; record-count growth test proves checkpoints do not create per-record OCC tables. |
-| WAL + Commit Fabric | PROVEN | Commit identity/checksum is attached to real durable mutations and verified during recovery. |
-| WAL/checkpoint recovery | PROVEN | Crash replay, truncated-tail tolerance, completed-record corruption rejection, stale WAL handling, backup checkpoint recovery, and recovery manifests. |
-| Durable transaction semantics | PROVEN | Multi-record commits, rollback, OCC retry, contention, restart durability, and failure recovery. |
-| Database ownership | PROVEN | Live second-owner rejection, heartbeat lease, abandoned dead-process recovery, release on close. |
-| Nested document/query engine | PROVEN | Dotted paths, logical/range/array operators, projection, sorting, pagination, aggregation, atomic update operators. |
-| Schema + TTL | PROVEN | Enforced/optional schema persistence, rejection before commit, durable TTL removal through normal commit path. |
-| Ordinary persistent indexes | PROVEN | Single/nested/compound/unique/sparse indexes, persistent bucket storage, bounded cache, reopen/catch-up, typed canonical keys. |
-| Persistent text indexes | PROVEN | Bucketed postings, bounded cache, incremental updates, restart persistence, ranked search. |
-| Persistent geo indexes | PROVEN | Persistent bounded geo cells, radius/nearest queries, incremental maintenance and reopen. |
-| Index failure safety | PROVEN | Corrupt secondary/text index tests prove production falls back to authoritative SSD scans rather than stale results; repair restores indexed operation. |
-| Realtime local/network streams | PROVEN | Post-durable publication, SSE resume, `Last-Event-ID`, replay/live continuation, cursor expiry, capacity and backpressure handling. |
-| Reactive query plane | PROVEN | Real commit consumption, dependency filtering, incremental insert/update/delete for safe shapes, ordered recompute fallback when incremental maintenance is unsafe. |
-| Selective Sync Views | PROVEN | Persisted bounded views, materialization, entry/exit deltas, cursor semantics. |
-| Offline transaction intents | PROVEN | Fsynced restart-persistent intents, integrity, preconditions, conflicts, retries, expiry/cancel states, real transaction reconciliation. |
-| Replication idempotency/reseed | PROVEN | Stable change IDs, duplicate rejection, cursor expiry, verified snapshot reseed, conflict convergence. |
-| Policy plane | PROVEN | Deny by default, deny override, request-body policies, declarative row constraints, safe query pushdown, wildcard/narrow-deny protection, independent compiled/reference verification. |
-| Query/Commit/Sync protocols | PROVEN | Versioned canonical digests, tamper rejection, compatibility negotiation; HTTP query planning uses integrity-checked Query IR and server exposes protocol capabilities. |
-| Hierarchical resource scheduler | PROVEN | Parent/child CPU/RAM/SSD/network/egress/coordination budgets, priorities, realtime/replication admission, TTL/PITR background scheduling, cost-aware transfer selection. |
-| Single-node bounded-memory architecture | PROVEN | Documents, primary offsets, ordinary indexes, text postings and geo cells use persistent bounded-cache paths; streaming scans are exercised. |
-| Deterministic sharding | PROVEN | Consistent hashing, targeted shard-key queries, scatter fallback, verified online moves and rebalancing. |
-| Quorum partition groups | PROVEN | Overlapping read/write quorums, read repair, minority repair, failed-quorum minority rollback, session monotonicity. |
-| Durable cross-shard transactions | PROVEN | Fsynced participants/coordinator, prepare reservations, routed-write exclusion, commit decision recovery after coordinator restart. |
-| Regional failover | PROVEN | Health routing, primary failover, quorum-backed regional writes, append-only global commit metadata. |
-| Global commit metadata | PROVEN | Tamper-evident append-only journal + bounded manifest; history is not resident in RAM. |
-| Dedicated subscription router | PROVEN | Real partition change streams, bounded subscription capacity, scheduler accounting and release. |
-| Authentication/token authority | PROVEN | Signed tokens, project scoping, canonical encoding, expiry, key rotation, token/subject/global revocation and durable tamper-checked revocation ledger. |
-| Request security | PROVEN | Body limits, malformed input rejection, request IDs, error redaction, rate limiting, deny-by-default authorization. |
-| TLS edge | PROVEN at software layer | HTTPS termination/proxy and live certificate-context reload tests pass. Public certificate/DNS operations remain external. |
-| Backup/restore/PITR | PROVEN at software layer | Encrypted backup, tamper detection, restore, migration rollback, PITR snapshots/journal/restart reconciliation. Remote object-store operation remains external. |
-| Observability/SLO plumbing | PROVEN at software layer | Metrics, durable audit, telemetry spool/retry/bounds, SLO calculations and health/storage status. Real alert destination/runbook response remains external. |
-| Managed runtime/control plane | PROVEN at software layer | Project isolation, capacity limits, region validation, durable restart, usage reporting, control API. Public multi-region infrastructure deployment remains external. |
-| Billing/entitlements/commercial state | PROVEN at software layer | Plans, durable usage, quota decisions, invoice calculations, checkout/portal/cancel provider boundary, signed webhook authority, payment failure/recovery, refunds. Live provider account remains external. |
-| Deployment/rollback primitives | PROVEN at software layer | Immutable release identity, candidate health gating, failed-candidate containment and rollback tests. Public artifact promotion remains external. |
-| Self-host production container | PROVEN | Non-root image build/start/health/authenticated durable API/clean shutdown gate. |
-| Closure audit | PROVEN | CI rejects TODO/FIXME/placeholders/not-implemented markers and skipped tests in `src`, `test`, and `bin`. |
-| CI qualification | PROVEN | Exact technical-superiority head passes Node 20, Node 22, proof, closure audit, all tests, and production container. |
-| Direct competitive benchmark superiority | UNVERIFIED | Benchmark harness exists; identical-hardware MongoDB/Redis/Firestore-style comparative evidence has not yet been run and accepted. |
-| Main branch protection | FAILED | GitHub reports `main` unprotected; current connector does not expose a branch-protection write action. |
+| Deterministic storage-failure injection | PROVEN | WAL accepts an internal I/O adapter while retaining real filesystem defaults; CI injects `ENOSPC` and `EROFS` deterministically. |
+| Disk-full write safety | PROVEN at repository layer | Injected `ENOSPC` proves a failed durable append is not published as an in-memory durable entry and the WAL queue can recover for the next valid write. |
+| Read-only compaction safety | PROVEN at repository layer | Injected `EROFS` proves failed compaction preserves the previously durable WAL and in-memory history. |
+| Public package surface | PROVEN | Qualification imports every declared package export, verifies every target exists, and verifies both CLI binary targets. |
+| Production-path benchmark harness | PROVEN as tooling | Benchmark now opens `openSuperiorProduction()` rather than the legacy compatibility engine; repeated trials report p50/p95 throughput, RSS, heap, storage, hardware identity, and bounded-memory state. |
+| Comparative benchmark acceptance gate | PROVEN as tooling | Comparison refuses mismatched workload or hardware and enforces declared throughput, memory, and storage ratios; three tests exercise pass and rejection paths. |
+| External deployment qualification command | PROVEN as tooling | `npm run qualify:external` requires a real HTTPS endpoint/token, validates certificate chain/expiry, health, protocol capability, authenticated write/read, anonymous denial, and cleanup. |
+| Closure audit coverage | PROVEN | Audit now covers qualification scripts as well as runtime/tests/binaries and rejects TODO/FIXME/placeholders/not-implemented, skipped tests, focused `.only` tests, and disabled test options. |
+| Direct competitive superiority | UNVERIFIED evidence gate | Syncio now has a strict comparable-results gate, but real MongoDB/Redis/Firestore-style baseline reports on the same hardware/workload have not been supplied or executed. |
+| Public production deployment | UNVERIFIED external evidence gate | Executable qualification exists, but no real public endpoint/token was supplied for this repository pass. |
+| Live payment-provider operation | UNVERIFIED external evidence gate | Provider-neutral software paths are proven; a real/sandbox provider account and credentials are required for provider evidence. |
+| Customer/market operation | UNVERIFIED external evidence gate | Requires real users and cannot be manufactured by repository tests. |
+| Main branch protection | FAILED external governance gate | GitHub still reports `main` unprotected. The available connector exposes branch-protection/ruleset reads but no write action. |
 
-## Qualification evidence at technical-superiority closure
+## Completion decision
 
-Exact qualification head before documentation-only closure: `7fb6c912e2315b27d81e2f31735304d5a486b9e8`.
+**REPOSITORY IMPLEMENTATION + REPOSITORY QUALIFICATION GAPS: PROVEN for the tested scope.**
 
-- Node 20: PASS
-- Node 22: PASS
-- tests: **169 passed / 0 failed / 0 skipped / 0 todo**
-- closure audit: PASS
-- proof gate: PASS
-- production container: PASS
-
-The suite includes adversarial failure injection for failed quorum rollback, prepared distributed reservations, coordinator recovery after a durable commit decision, corrupt secondary index fallback/repair, corrupt text-index fallback, wildcard-policy deny precedence, WAL/checkpoint corruption, replication expiry/reseed, token tampering/revocation, and deployment failure containment.
-
-## Technical completion decision
-
-**TECHNICAL-SUPERIORITY IMPLEMENTATION: PROVEN for the tested repository scope.**
-
-This means the architecture that was previously listed as unfinished is now implemented and integrated: storage-backed write sets, Commit Fabric, reactive queries, selective sync, compiled policy planning, hierarchical scheduling, bounded persistent indexes, versioned protocols, quorum replication, durable cross-partition transactions, regional failover, global commit metadata, and failure-safe authoritative index fallback.
-
-It does **not** mean Syncio has empirically proven that it outperforms MongoDB, Redis, or Firestore. That specific comparative claim remains blocked on direct accepted benchmark evidence.
-
-## External launch gates, not missing repository implementations
-
-The remaining blockers are operational/evidence gates rather than the architectural implementation tranche requested here:
-
-1. **Repository governance:** protect `main` and require qualification checks when a branch-protection write path is available.
-2. **Public infrastructure:** deploy the managed control/data planes to real regions, DNS/TLS, storage, telemetry and backup destinations and run failover exercises there.
-3. **Live payment operations:** connect a real/sandbox payment provider account and exercise checkout → verified entitlement → failed payment → recovery/cancel/refund end to end.
-4. **Competitive evidence:** run identical-workload 1×/10×/100× comparisons against accepted MongoDB/Redis/realtime baselines on declared hardware.
-5. **Customer evidence:** exercise onboarding, support, export/deletion and retention with real users before claiming commercial-market completion.
-
-Those gates must not be mislabeled as unimplemented database architecture.
+The remaining items are evidence or operations outside the repository: protect `main`, run accepted same-hardware competitor benchmarks, deploy to real infrastructure and run `npm run qualify:external`, exercise a real payment provider, and obtain customer evidence. None of those should be mislabeled as missing database code, and none should be claimed complete until the corresponding real-world evidence exists.
