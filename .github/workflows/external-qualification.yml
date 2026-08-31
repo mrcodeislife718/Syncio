@@ -1,0 +1,50 @@
+name: External Production Qualification
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify-public-endpoint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --ignore-scripts --no-package-lock
+      - name: Qualify public Syncio endpoint
+        env:
+          SYNCIO_PUBLIC_BASE_URL: ${{ secrets.SYNCIO_PUBLIC_BASE_URL }}
+          SYNCIO_PUBLIC_TOKEN: ${{ secrets.SYNCIO_PUBLIC_TOKEN }}
+          SYNCIO_EXTERNAL_PROJECT: ${{ vars.SYNCIO_EXTERNAL_PROJECT }}
+        run: npm run qualify:external | tee external-qualification.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: external-qualification-evidence
+          path: external-qualification.json
+          if-no-files-found: error
+
+  qualify-stripe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --ignore-scripts --no-package-lock
+      - name: Qualify Stripe account and recurring price
+        env:
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          SYNCIO_STRIPE_PRICE_ID: ${{ vars.SYNCIO_STRIPE_PRICE_ID }}
+        run: npm run qualify:stripe | tee stripe-qualification.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stripe-qualification-evidence
+          path: stripe-qualification.json
+          if-no-files-found: error
