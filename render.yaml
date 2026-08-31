@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: syncio
+    runtime: docker
+    plan: 0.5c-512mb
+    region: virginia
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - key: SYNCIO_AUTH_SECRET
+        generateValue: true
+      - key: SYNCIO_PROJECT_ID
+        value: syncio-production
+      - key: SYNCIO_DATA_FILE
+        value: /var/lib/syncio/data.syncio.json
+      - key: NODE_ENV
+        value: production
+    disk:
+      name: syncio-data
+      mountPath: /var/lib/syncio
+      sizeGB: 1
