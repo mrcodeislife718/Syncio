@@ -7,19 +7,17 @@ export function createStripePaymentProvider({ secretKey, apiBase = 'https://api.
   const key = required(secretKey, 'Stripe secretKey');
   if (typeof fetchImpl !== 'function') throw new TypeError('Stripe provider requires fetch');
 
-  async function request(path, fields, idempotencyKey) {
+  async function request(path, fields, idempotencyKey, method = 'POST') {
     const body = new URLSearchParams();
-    for (const [name, value] of Object.entries(fields ?? {})) {
-      if (value !== undefined && value !== null) body.set(name, String(value));
-    }
+    for (const [name, value] of Object.entries(fields ?? {})) if (value !== undefined && value !== null) body.set(name, String(value));
     const response = await fetchImpl(`${apiBase}${path}`, {
-      method: 'POST',
+      method,
       headers: {
         authorization: `Bearer ${key}`,
         'content-type': 'application/x-www-form-urlencoded',
         ...(idempotencyKey ? { 'idempotency-key': idempotencyKey } : {})
       },
-      body,
+      body: body.size ? body : undefined,
       signal: AbortSignal.timeout(15_000)
     });
     const payload = await response.json().catch(() => null);
@@ -37,13 +35,8 @@ export function createStripePaymentProvider({ secretKey, apiBase = 'https://api.
     async createCheckoutSession({ project, plan, successUrl, cancelUrl, idempotencyKey }) {
       const priceId = required(plan?.priceId ?? plan?.stripePriceId ?? plan, 'Stripe priceId');
       const result = await request('/checkout/sessions', {
-        mode: 'subscription',
-        success_url: required(successUrl, 'successUrl'),
-        cancel_url: required(cancelUrl, 'cancelUrl'),
-        'line_items[0][price]': priceId,
-        'line_items[0][quantity]': 1,
-        client_reference_id: project.id,
-        'metadata[projectId]': project.id
+        mode: 'subscription', success_url: required(successUrl, 'successUrl'), cancel_url: required(cancelUrl, 'cancelUrl'),
+        'line_items[0][price]': priceId, 'line_items[0][quantity]': 1, client_reference_id: project.id, 'metadata[projectId]': project.id
       }, idempotencyKey);
       return { id: result.id, url: result.url, customerId: result.customer ?? null, subscriptionId: result.subscription ?? null };
     },
@@ -56,15 +49,13 @@ export function createStripePaymentProvider({ secretKey, apiBase = 'https://api.
       const id = required(subscriptionId, 'subscriptionId');
       const result = atPeriodEnd
         ? await request(`/subscriptions/${encodeURIComponent(id)}`, { cancel_at_period_end: true }, idempotencyKey)
-        : await request(`/subscriptions/${encodeURIComponent(id)}`, {}, idempotencyKey);
+        : await request(`/subscriptions/${encodeURIComponent(id)}`, {}, idempotencyKey, 'DELETE');
       return { id: result.id, status: result.status, cancelAtPeriodEnd: Boolean(result.cancel_at_period_end) };
     },
     async refundPayment({ paymentId, amount, reason, idempotencyKey }) {
-      const result = await request('/refunds', {
-        payment_intent: required(paymentId, 'paymentId'),
-        amount: amount == null ? undefined : Math.round(Number(amount)),
-        reason: reason ?? undefined
-      }, idempotencyKey);
+      const numericAmount = amount == null ? undefined : Number(amount);
+      if (numericAmount !== undefined && (!Number.isFinite(numericAmount) || numericAmount <= 0)) throw new TypeError('refund amount must be positive');
+      const result = await request('/refunds', { payment_intent: required(paymentId, 'paymentId'), amount: numericAmount == null ? undefined : Math.round(numericAmount), reason: reason ?? undefined }, idempotencyKey);
       return { id: result.id, status: result.status, amount: result.amount ?? null, paymentId: result.payment_intent ?? paymentId };
     }
   });
