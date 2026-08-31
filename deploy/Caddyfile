@@ -1,0 +1,21 @@
+{$SYNCIO_DOMAIN} {
+  encode zstd gzip
+  reverse_proxy syncio:8787 {
+    health_uri /health
+    health_interval 15s
+    transport http {
+      dial_timeout 5s
+      response_header_timeout 30s
+    }
+  }
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "no-referrer"
+    -Server
+  }
+  log {
+    output stdout
+    format json
+  }
+}

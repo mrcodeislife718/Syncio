@@ -1,6 +1,6 @@
 {
   "name": "syncio-db",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Syncio lightweight realtime document database.",
   "type": "module",
   "exports": {
@@ -28,6 +28,7 @@
     "./tls-edge": "./src/tls-edge.js",
     "./deployment": "./src/deployment.js",
     "./payments": "./src/payments.js",
+    "./stripe-provider": "./src/stripe-provider.js",
     "./monetization": "./src/monetization.js",
     "./usage-sampler": "./src/usage-sampler.js",
     "./managed-runtime": "./src/managed-runtime.js",
@@ -63,10 +64,9 @@
     "benchmark:compare": "node scripts/benchmark-compare.mjs",
     "qualify:evidence": "node scripts/superiority-v2-evidence.mjs",
     "qualify:external": "node scripts/external-qualification.mjs",
+    "qualify:stripe": "node scripts/stripe-qualification.mjs",
     "qualify": "npm run check && npm run check:public-api && npm run audit:closure && npm run qualify:evidence && npm test"
   },
-  "engines": {
-    "node": ">=20"
-  },
+  "engines": { "node": ">=20" },
   "license": "MIT"
 }
