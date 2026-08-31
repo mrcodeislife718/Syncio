@@ -17,9 +17,9 @@ if (!secret || Buffer.byteLength(secret) < 32) {
   process.stdout.write(`${authority.issue({subject,projectId,role:'owner',entitlements:['database','realtime']})}\n`);
 } else if (command === 'serve') {
   const host = process.env.SYNCIO_HOST ?? '0.0.0.0';
-  const port = Number(process.env.SYNCIO_PORT ?? 8787);
+  const port = Number(process.env.SYNCIO_PORT ?? process.env.PORT ?? 8787);
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
-    console.error('SYNCIO_PORT must be an integer between 1 and 65535');
+    console.error('SYNCIO_PORT/PORT must be an integer between 1 and 65535');
     process.exitCode = 64;
   } else {
     const runtime = await startSelfHostedSyncio({file,secret,projectId,host,port});
