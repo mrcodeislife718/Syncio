@@ -1,0 +1,46 @@
+services:
+  syncio:
+    build: .
+    restart: unless-stopped
+    environment:
+      SYNCIO_AUTH_SECRET: ${SYNCIO_AUTH_SECRET:?set SYNCIO_AUTH_SECRET}
+      SYNCIO_PROJECT_ID: ${SYNCIO_PROJECT_ID:-production}
+      SYNCIO_DATA_FILE: /var/lib/syncio/data.syncio.json
+      SYNCIO_HOST: 0.0.0.0
+      SYNCIO_PORT: 8787
+    volumes:
+      - syncio-data:/var/lib/syncio
+    expose:
+      - "8787"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      syncio:
+        condition: service_healthy
+    environment:
+      SYNCIO_DOMAIN: ${SYNCIO_DOMAIN:?set SYNCIO_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  syncio-data:
+  caddy-data:
+  caddy-config:
