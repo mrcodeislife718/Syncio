@@ -10,6 +10,48 @@ The product target is:
 - self-hosting and provider independence;
 - a managed Syncio Cloud path that turns the same database into recurring infrastructure revenue.
 
+## Proof before claims
+
+Syncio separates **implemented architecture** from **comparatively proven advantage**.
+
+The repository proof path is:
+
+```text
+problem -> architectural invariant -> mechanism -> test -> measurement -> same-workload comparison -> claim
+```
+
+A feature does not become a superiority claim merely because it exists. Comparative evidence must record hardware, OS/kernel, storage, database versions, configuration, dataset, workload, warmup, duration, raw measurements, failure behavior, and a reproducibility seed.
+
+- [`docs/PROOF_PATH.md`](docs/PROOF_PATH.md) — architecture map, mechanism-to-evidence matrix, falsification criteria, and benchmark doctrine.
+- [`docs/TECHNICAL_SUPERIORITY_V2.md`](docs/TECHNICAL_SUPERIORITY_V2.md) — the twelve-part technical-superiority architecture and 1×/10×/100× contract.
+- [`docs/PRODUCTION_QUALIFICATION.md`](docs/PRODUCTION_QUALIFICATION.md) — production and external qualification gates.
+
+### Architecture at a glance
+
+```mermaid
+flowchart TD
+    A[Application API] --> B[Protocol / Query / Sync IR]
+    B --> C[Policy + Admission + Cost Governor]
+    C --> D[Transaction + Consistency Domains]
+    D --> E[Commit Fabric\nCanonical State Truth]
+
+    E --> F[State Plane]
+    E --> G[Reactive Plane]
+    E --> H[Sync Plane]
+    E --> I[Replication Plane]
+
+    F --> J[Adaptive Segments\nBounded Working Set]
+    G --> K[Shared Reactive Graph]
+    H --> L[Durable Offline Intents]
+    I --> M[Partition Groups\nAnti-Entropy]
+
+    J --> N[State Roots + Recovery Manifests]
+    M --> N
+    N --> O[PITR / Backup / Replay]
+```
+
+The invariant is simple: **Commit Fabric stays authoritative.** Everything else is a consumer, accelerator, projection, transport, or replica of that truth.
+
 ## Current status
 
 The technical-superiority implementation is integrated into the production/self-host runtime and qualification suite. The repository contains the embedded database, storage-backed production engine, authenticated self-host runtime, managed runtime, control plane, usage/invoice engine, provider-neutral payment boundary, TLS edge, deployment/rollback primitives, bounded indexes, distributed partition groups, durable cross-shard transactions, regional failover, and production verification suites.
@@ -120,6 +162,12 @@ npm run benchmark
 
 `npm run qualify` checks syntax, imports every declared package export, audits runtime/test/CLI/qualification code for unfinished or disabled work, and runs the complete Node test suite. CI repeats qualification on Node 20 and Node 22, runs an independent proof gate, and boots the non-root production container.
 
+To validate benchmark evidence metadata:
+
+```bash
+npm run qualify:evidence -- <manifest.json>
+```
+
 To compare benchmark reports, Syncio refuses mismatched hardware or workloads:
 
 ```bash
@@ -165,7 +213,9 @@ await db.close();
 
 ## Documentation
 
+- `docs/PROOF_PATH.md` — evidence-first architecture map and falsification criteria.
 - `docs/ARCHITECTURE.md` — architecture, invariants, and scale boundaries.
+- `docs/TECHNICAL_SUPERIORITY_V2.md` — technical-superiority V2 mechanisms and evidence contract.
 - `docs/COMMERCIALIZATION.md` — plans, metering, invoices, funnel and commercial products.
 - `docs/COMPLETION_LEDGER.md` — evidence-backed capability status.
 - `docs/PRODUCTION_QUALIFICATION.md` — independent launch qualification.
