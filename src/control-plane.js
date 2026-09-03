@@ -76,7 +76,7 @@ export class SyncioControlPlane {
     await this.db.transaction(async (tx) => {
       const current=tx.collection('_projects').get(projectId);
       if(!current||current.status!=='active')throw notFound('project_not_found');
-      tx.collection('_projects').put({ ...current, plan, updatedAt:now });
+      tx.collection('_projects').put({ ...current, plan, billingStatus:'active', updatedAt:now });
       tx.collection('_entitlements').put({ id:projectId, projectId, grants:[...PLAN_ENTITLEMENTS[plan]], source, externalReference, updatedAt:now });
     });
     return this.project(projectId);
@@ -159,8 +159,11 @@ export class BillingStateProcessor {
       const project=projects.get(projectId);
       if(!project||project.status!=='active')throw notFound('project_not_found');
       const now=new Date().toISOString();
-      projects.put({...project,plan:targetPlan,billingStatus:status==='past_due'?'past_due':'active',updatedAt:now});
-      tx.collection('_entitlements').put({id:projectId,projectId,grants:[...PLAN_ENTITLEMENTS[targetPlan]],source:`billing:${provider}${targetPlan==='free'?':cancelled':''}`,externalReference:id,updatedAt:now});
+      const pastDue=status==='past_due';
+      const effectiveGrants=pastDue?PLAN_ENTITLEMENTS.free:PLAN_ENTITLEMENTS[targetPlan];
+      const entitlementSource=pastDue?`billing:${provider}:past_due`:`billing:${provider}${targetPlan==='free'?':cancelled':''}`;
+      projects.put({...project,plan:targetPlan,billingStatus:pastDue?'past_due':'active',updatedAt:now});
+      tx.collection('_entitlements').put({id:projectId,projectId,grants:[...effectiveGrants],source:entitlementSource,externalReference:id,updatedAt:now});
       events.put({id,projectId,type,plan:plan??null,status,provider,occurredAt,processedAt:now});
     });
     if(duplicate)return{duplicate:true,applied:false};
