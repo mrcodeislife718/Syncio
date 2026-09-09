@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { normalizeWriteProvenance } from './write-provenance.js';
+import { currentWriteProvenance, normalizeWriteProvenance } from './write-provenance.js';
 
 const stable = value => {
   if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
@@ -7,9 +7,9 @@ const stable = value => {
   return JSON.stringify(value);
 };
 
-export function createCommitFabric({ databaseId, partitionId = 'local', sequence, logicalTime = Date.now(), transactionId = null, origin = 'local', mutations = [], schemaVersion = 1, policyVersion = 1, causalParents = [], provenance = null }) {
+export function createCommitFabric({ databaseId, partitionId = 'local', sequence, logicalTime = Date.now(), transactionId = null, origin = 'local', mutations = [], schemaVersion = 1, policyVersion = 1, causalParents = [], provenance = undefined }) {
   if (!databaseId || !Number.isSafeInteger(sequence) || sequence < 1) throw new TypeError('invalid commit identity');
-  const normalizedProvenance = normalizeWriteProvenance(provenance);
+  const normalizedProvenance = normalizeWriteProvenance(provenance === undefined ? currentWriteProvenance() : provenance);
   const body = {
     version: 2,
     databaseId,
