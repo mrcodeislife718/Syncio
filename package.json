@@ -42,6 +42,7 @@
     "./billing": "./src/billing.js",
     "./wal": "./src/wal.js",
     "./commit-fabric": "./src/commit-fabric.js",
+    "./write-provenance": "./src/write-provenance.js",
     "./reactive": "./src/reactive.js",
     "./sync-plane": "./src/sync-plane.js",
     "./scheduler": "./src/scheduler.js",
