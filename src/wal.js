@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { currentWriteProvenance, normalizeWriteProvenance } from './write-provenance.js';
 
 const FORMAT = 'syncio-wal/1';
 
@@ -29,6 +30,19 @@ export class WriteAheadLog {
     assertSequence(resultSequence, 'WAL resultSequence');
     if (resultSequence <= baseSequence) throw new TypeError('WAL resultSequence must advance baseSequence');
     if (!Array.isArray(events) || !events.length) throw new TypeError('WAL events must be a non-empty array');
+
+    const ambientProvenance = currentWriteProvenance();
+    if (ambientProvenance) {
+      for (const event of events) {
+        if (!event || typeof event !== 'object' || Array.isArray(event)) throw new TypeError('WAL event must be an object');
+        event.provenance = normalizeWriteProvenance(event.provenance ?? ambientProvenance);
+      }
+    } else {
+      for (const event of events) {
+        if (event?.provenance !== undefined) event.provenance = normalizeWriteProvenance(event.provenance);
+      }
+    }
+
     const payload = {
       format: FORMAT,
       databaseId,
@@ -109,6 +123,12 @@ function validateEntry(entry, file, line) {
   assertSequence(entry.resultSequence, 'WAL resultSequence');
   if (entry.resultSequence <= entry.baseSequence || !Array.isArray(entry.events) || !entry.events.length) {
     throw corruptWal(file, line, new Error('invalid WAL sequence/events'));
+  }
+  for (const event of entry.events) {
+    if (event?.provenance !== undefined) {
+      try { normalizeWriteProvenance(event.provenance); }
+      catch (error) { throw corruptWal(file, line, error); }
+    }
   }
   const payload = {
     format: entry.format,
