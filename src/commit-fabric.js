@@ -11,7 +11,7 @@ export function createCommitFabric({ databaseId, partitionId = 'local', sequence
   if (!databaseId || !Number.isSafeInteger(sequence) || sequence < 1) throw new TypeError('invalid commit identity');
   const normalizedProvenance = normalizeWriteProvenance(provenance === undefined ? currentWriteProvenance() : provenance);
   const body = {
-    version: 2,
+    version: normalizedProvenance ? 2 : 1,
     databaseId,
     partitionId,
     sequence,
@@ -34,6 +34,8 @@ export function verifyCommitFabric(commit) {
   const { commitId, checksum, ...body } = commit;
   try {
     if (body.provenance !== undefined) normalizeWriteProvenance(body.provenance);
+    if (commit.version === 1 && body.provenance !== undefined) return false;
+    if (commit.version === 2 && body.provenance === undefined) return false;
   } catch {
     return false;
   }
